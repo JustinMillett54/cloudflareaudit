@@ -103,6 +103,9 @@ BEST_PRACTICE_SETTINGS = {
     "websockets": {"expected": "on", "severity": "Low", "description": "WebSockets should be enabled if needed"},
 }
 
+# Cache settings thresholds
+MIN_BROWSER_CACHE_TTL = 3600  # Minimum recommended browser cache TTL in seconds (1 hour)
+
 # Risk register template for disabled rules
 class RiskRegister:
     def __init__(self):
@@ -1947,10 +1950,10 @@ def check_cache_settings(zone_id, zone_name):
         if response.status_code == 200:
             data = response.json()
             ttl = data['result']['value']
-            if ttl < 3600:  # Less than 1 hour
+            if ttl < MIN_BROWSER_CACHE_TTL:
                 findings.append({
                     'severity': 'Low',
-                    'description': f"{zone_name}: Browser Cache TTL is {ttl} seconds (less than 1 hour).",
+                    'description': f"{zone_name}: Browser Cache TTL is {ttl} seconds (less than recommended {MIN_BROWSER_CACHE_TTL} seconds).",
                     'recommendation': "Consider increasing browser cache TTL for better performance."
                 })
             else:
@@ -2030,7 +2033,9 @@ def export_to_csv(zone_data, output_dir):
         'inventory': inventory_file,
         'dns': dns_file
     }
-    # Grab all DNS records, paging through if there's a lot
+
+def fetch_all_dns_records(zone_id, zone_name):
+    """Fetch all DNS records for a zone, handling pagination"""
     dns_records = []
     page = 1
     per_page = 100
@@ -2576,7 +2581,7 @@ def main():
     """Main audit function - enhanced with comprehensive Cloudflare best practice checks"""
     
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Cloudflare Security Audit Tool v' + VERSION)
+    parser = argparse.ArgumentParser(description=f'Cloudflare Security Audit Tool v{VERSION}')
     parser.add_argument('--output-dir', default='cloudflare_audit_reports', help='Output directory for reports')
     parser.add_argument('--csv', action='store_true', help='Export data to CSV files')
     parser.add_argument('--zones', nargs='+', help='Specific zone IDs to audit (default: all zones)')
@@ -2712,7 +2717,10 @@ def main():
             dns_records = fetch_all_dns_records(zone_id, zone_name)
             if isinstance(dns_records, str):  # Error message
                 logger.warning(f"DNS fetch returned error: {dns_records}")
+                print(f"    ⚠️  DNS fetch failed: {dns_records}")
                 dns_records = []
+            else:
+                print(f"    ✓ Retrieved {len(dns_records)} DNS record(s)")
         
         # Count findings
         for f in findings:
