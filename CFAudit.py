@@ -2,1231 +2,1511 @@ import requests
 import json
 import logging
 import os
+import io
+import base64
+import random
+import time
+from datetime import datetime, timedelta, timezone
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
+import seaborn as sns
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-import pypandoc
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend for PDF generation
-import matplotlib.pyplot as plt
-import io
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
 import jinja2
-import time
-import base64
-from datetime import datetime  # Added this for date formatting in reports
+import pypandoc
 
-# Logging setup - good for debugging API calls and errors
+# --- CONFIGURATION ---
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('cloudflare_audit.log'),
-        logging.StreamHandler()
-    ]
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    handlers=[logging.FileHandler('audit.log'), logging.StreamHandler()]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("CloudflareAudit")
 
-# API configuration - pull from env vars for security
 CLOUDFLARE_API_TOKEN = os.getenv('CLOUDFLARE_API_TOKEN')
 CLOUDFLARE_API_EMAIL = os.getenv('CLOUDFLARE_API_EMAIL')
 BASE_URL = "https://api.cloudflare.com/client/v4"
+GRAPHQL_URL = "https://api.cloudflare.com/client/v4/graphql"
 
-# Headers for API requests - auth stuff here
-headers = {
+# Set this to True to force mock data even if real data exists
+FORCE_DEMO_MODE = False 
+
+if not CLOUDFLARE_API_TOKEN:
+    logger.error("Missing CLOUDFLARE_API_TOKEN environment variable.")
+    exit(1)
+
+HEADERS = {
     "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-    "X-Auth-Email": CLOUDFLARE_API_EMAIL,
     "Content-Type": "application/json"
 }
+if CLOUDFLARE_API_EMAIL:
+    HEADERS["X-Auth-Email"] = CLOUDFLARE_API_EMAIL
 
-# Jinja2 environment setup - using this for HTML templates
-env = jinja2.Environment()
+# --- BEST PRACTICES DEFINITIONS ---
+# Note: Severity is dynamically adjusted based on Plan Level in the logic now
+BEST_PRACTICES = {
+    "min_tls_version": {"expected": "1.2", "severity": "Critical"},
+    "always_use_https": {"expected": "on", "severity": "High"},
+    "dnssec": {"expected": "active", "severity": "Medium"},
+    "browser_check": {"expected": "on", "severity": "Low"},
+    "security_level": {"expected": ["medium", "high", "under_attack"], "severity": "Medium"},
+    "waf": {"expected": True, "severity": "Critical"},
+    "bot_management": {"expected": True, "severity": "High"},
+    "rate_limiting": {"expected": True, "severity": "High"},
+    "brotli": {"expected": "on", "severity": "Low"},
+    "http3": {"expected": "on", "severity": "Low"},
+    "always_online": {"expected": "on", "severity": "Low"},
+    "minify": {"expected": "on", "severity": "Low"},
+    "automatic_https_rewrites": {"expected": "on", "severity": "Medium"},
+    "opportunistic_encryption": {"expected": "on", "severity": "Low"},
+    "hotlink_protection": {"expected": "on", "severity": "Low"},
+    "email_spf": {"expected": True, "severity": "High"},
+    "email_dmarc": {"expected": True, "severity": "High"},
+    "page_shield": {"expected": True, "severity": "Medium"}
+}
 
-# HTML template for zone and summary reports - this is the base structure for reports
-template_string = """
+# --- EXECUTIVE RISK CONTEXT ---
+RISK_CATALOG = {
+    "TLS Version": {
+        "impact": "Using legacy TLS versions (1.0/1.1) exposes traffic to decryption attacks (e.g., POODLE, BEAST). It also violates compliance standards like PCI DSS.",
+        "fix": "Navigate to SSL/TLS > Edge Certificates and set Minimum TLS Version to 1.2."
+    },
+    "Managed WAF": {
+        "impact": "Without Managed WAF rules, applications are exposed to Top 10 web vulnerabilities like SQL Injection and Cross-Site Scripting (XSS).",
+        "fix": "Enable the 'Cloudflare Managed Ruleset' in the WAF configuration."
+    },
+    "Rate Limiting": {
+        "impact": "Lack of rate limiting leaves login pages and APIs vulnerable to Brute Force attacks, Credential Stuffing, and Denial of Service (DoS).",
+        "fix": "Configure Rate Limiting rules for sensitive endpoints (e.g., /login, /api)."
+    },
+    "Always Use HTTPS": {
+        "impact": "Allowing HTTP connections enables attackers to intercept sensitive data (Man-in-the-Middle attacks).",
+        "fix": "Enable 'Always Use HTTPS' in the Edge Certificates settings."
+    },
+    "DNSSEC": {
+        "impact": "Inactive DNSSEC allows attackers to spoof DNS responses and redirect users to malicious clones of your site.",
+        "fix": "Enable DNSSEC in the DNS settings tab."
+    },
+    "OWASP WAF": {
+        "impact": "Missing OWASP Core Rules reduces protection against the most common web application vulnerabilities identified by security researchers.",
+        "fix": "Enable the OWASP ModSecurity Core Rule Set in the WAF."
+    },
+    "Brotli Compression": {
+        "impact": "Disabling compression increases bandwidth usage and slows down page load times for end users.",
+        "fix": "Enable Brotli in Speed > Optimization settings."
+    },
+    "HTTP/3": {
+        "impact": "Legacy HTTP protocols are slower and less secure. HTTP/3 improves performance significantly, especially on mobile networks.",
+        "fix": "Enable HTTP/3 (QUIC) in Network settings."
+    },
+    "Asset Minification": {
+        "impact": "Unminified code (JS/CSS) increases payload size, resulting in slower Largest Contentful Paint (LCP) scores.",
+        "fix": "Enable Auto Minify for JavaScript, CSS, and HTML."
+    },
+    "WAF Rule Override": {
+        "impact": "Disabling specific managed rules weakens the security posture and may leave known vulnerabilities exposed.",
+        "fix": "Review disabled rules and re-enable them if they are not false positives."
+    },
+    "Whitelisted IP List": {
+        "impact": "Whitelisting entire IP lists can inadvertently allow malicious traffic if the list contains compromised IPs.",
+        "fix": "Review IP lists and ensure only trusted IPs are whitelisted."
+    },
+    "Email Security (SPF/DMARC)": {
+        "impact": "Missing SPF or DMARC records allows attackers to easily spoof emails from your domain, leading to phishing attacks against your customers.",
+        "fix": "Add valid SPF and DMARC TXT records in the DNS tab."
+    },
+    "Automatic HTTPS Rewrites": {
+        "impact": "Mixed content (HTTP resources on HTTPS pages) creates security warnings for users and can block content loading.",
+        "fix": "Enable Automatic HTTPS Rewrites in SSL/TLS > Edge Certificates."
+    },
+    "Hotlink Protection": {
+        "impact": "Without hotlink protection, third-party sites can embed your images, stealing your bandwidth and increasing your costs.",
+        "fix": "Enable Hotlink Protection in Scrape Shield."
+    },
+    "WAF Permissive Config": {
+        "impact": "High traffic volume with ZERO threats detected usually indicates WAF rules are missing or turned off, leaving the site exposed.",
+        "fix": "Enable Cloudflare Managed Rulesets and review Firewall Events."
+    },
+    "Unused Feature (ROI)": {
+        "impact": "This feature is included in your plan but is currently disabled. You are paying for security/performance capabilities you are not using.",
+        "fix": "Enable and configure this feature to maximize the value of your subscription."
+    }
+}
+
+# --- TEMPLATES ---
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cloudflare Security Audit Report - {{ title }}</title>
+    <title>Security Audit - {{ title }}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script>
+        function toggleDarkMode() {
+            document.body.classList.toggle('dark-mode');
+            const isDark = document.body.classList.contains('dark-mode');
+            localStorage.setItem('darkMode', isDark);
+            document.getElementById('darkModeBtn').innerText = isDark ? '☀️ Light Mode' : '🌙 Dark Mode';
+        }
+        window.onload = function() {
+            if (localStorage.getItem('darkMode') === 'true') {
+                document.body.classList.add('dark-mode');
+                document.getElementById('darkModeBtn').innerText = '☀️ Light Mode';
+            }
+        }
+    </script>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        h1 { font-size: 24px; font-weight: bold; margin-bottom: 16px; }
-        h2 { font-size: 20px; font-weight: bold; margin-top: 24px; margin-bottom: 8px; }
-        p { margin-bottom: 8px; }
-        table { width: 100%; border-collapse: collapse; margin-bottom: 24px; }
-        th, td { border: 1px solid #000; padding: 8px; text-align: left; }
-        th { background-color: #d3d3d3; font-weight: bold; }
-        .critical { background-color: #CC3333; color: #000000; }
-        .high { background-color: #CC6633; color: #000000; }
-        .medium { background-color: #CCCC33; color: #000000; }
-        .low { background-color: #33CC33; color: #000000; }
-        .compliant { background-color: #3366CC; color: #000000; }
-        .break-words { word-wrap: break-word; max-width: 0; }
-        img { max-width: 50%; height: auto; }
+        body { background-color: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; transition: background-color 0.3s, color 0.3s; }
+        .container { max-width: 1200px; margin-top: 30px; }
+        .card { margin-bottom: 20px; border: none; box-shadow: 0 4px 6px rgba(0,0,0,0.1); transition: background-color 0.3s, color 0.3s; }
+        .card-header { background-color: #2c3e50; color: white; font-weight: bold; }
+        .severity-Critical { background-color: #dc3545; color: white; }
+        .severity-High { background-color: #fd7e14; color: white; }
+        .severity-Medium { background-color: #ffc107; color: black; }
+        .severity-Low { background-color: #28a745; color: white; }
+        .severity-Pass { background-color: #198754; color: white; }
+        .severity-Info { background-color: #17a2b8; color: white; }
+        .table th { background-color: #343a40; color: white; }
+        .chart-container { text-align: center; margin: 20px 0; }
+        img { max-width: 100%; height: auto; border-radius: 4px; }
+        .badge { font-size: 0.9em; padding: 8px 12px; }
+        
+        /* Dark Mode Overrides */
+        body.dark-mode { background-color: #121212; color: #e0e0e0; }
+        body.dark-mode .card { background-color: #1e1e1e; color: #e0e0e0; box-shadow: 0 4px 6px rgba(255,255,255,0.05); }
+        body.dark-mode .card-header { background-color: #333; color: #fff; }
+        
+        /* Flawless Table Dark Mode */
+        body.dark-mode .table { 
+            color: #e0e0e0 !important; 
+            border-color: #444; 
+            --bs-table-bg: transparent;
+            --bs-table-color: #e0e0e0;
+            --bs-table-hover-color: #fff;
+        }
+        body.dark-mode .table thead th { 
+            background-color: #2c2c2c; 
+            color: #fff; 
+            border-color: #444; 
+        }
+        body.dark-mode .table td, 
+        body.dark-mode .table th { 
+            border-color: #444; 
+            color: inherit; 
+        }
+        
+        /* Fix Striped Rows in Dark Mode */
+        body.dark-mode .table-striped > tbody > tr:nth-of-type(odd) > * {
+            background-color: rgba(255, 255, 255, 0.05);
+            color: #e0e0e0;
+        }
+        
+        /* Fix Hover State in Dark Mode */
+        body.dark-mode .table-hover tbody tr:hover > * { 
+            color: #fff !important; 
+            background-color: rgba(255, 255, 255, 0.1); 
+        }
+        
+        body.dark-mode .list-group-item { background-color: #1e1e1e; color: #e0e0e0; border-color: #444; }
+        body.dark-mode .alert-warning { background-color: #332701; color: #ffda6a; border-color: #664d03; }
+        body.dark-mode .alert-info { background-color: #032830; color: #6edff6; border-color: #055160; }
+        body.dark-mode .text-muted { color: #adb5bd !important; }
     </style>
 </head>
 <body>
-    <h1>Cloudflare Security Audit Report - {{ title }}</h1>
-    <p>Prepared by: Optiv Security</p>
-    <p>Date: {{ date }}</p>
+    <div class="container">
+        <div class="d-flex justify-content-between align-items-center mb-5">
+            <div class="text-center w-100">
+                <h1 class="display-4">Cloudflare Security Audit</h1>
+                <p class="lead">Zone: <strong>{{ title }}</strong> | Plan: <strong>{{ plan }}</strong> | Date: {{ date }}</p>
+            </div>
+            <button id="darkModeBtn" class="btn btn-outline-secondary position-absolute end-0 me-5" onclick="toggleDarkMode()">
+                🌙 Dark Mode
+            </button>
+        </div>
 
-    {% if zone_name %}
-    <p>Domain: {{ zone_name }}</p>
-    <p>Zone ID: {{ zone_id }}</p>
+        {% if is_mock %}
+        <div class="alert alert-warning">
+            <strong>DEMO MODE:</strong> No real traffic detected. Showing sample data for visualization purposes.
+        </div>
+        {% endif %}
+        
+        <a href="Portfolio_Executive_Summary.html" class="btn btn-outline-primary mb-3">&larr; Back to Portfolio Summary</a>
 
-    <h2>Findings</h2>
-    {% if findings %}
-    <table>
-        <thead>
-            <tr>
-                <th>Severity</th>
-                <th>Description</th>
-                <th>Recommendation</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for finding in findings %}
-            <tr class="{{ finding.severity.lower() }}">
-                <td>{{ finding.severity }}</td>
-                <td class="break-words">{{ finding.description }}</td>
-                <td class="break-words">{{ finding.recommendation }}</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    {% else %}
-    <p>No findings available.</p>
-    {% endif %}
+        <!-- LEGEND SECTION -->
+        <div class="card mb-4">
+            <div class="card-header">Report Legend & Key</div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-md-6">
+                        <h6>Severity Levels</h6>
+                        <ul class="list-unstyled">
+                            <li><span class="badge severity-Critical">Critical</span> Immediate risk.</li>
+                            <li><span class="badge severity-High">High</span> Serious vulnerability or ROI Loss.</li>
+                            <li><span class="badge severity-Medium">Medium</span> Best practice violation.</li>
+                            <li><span class="badge severity-Info">Info</span> Plan limitation or FYIs.</li>
+                            <li><span class="badge severity-Pass">Pass</span> Configuration meets best practices.</li>
+                        </ul>
+                    </div>
+                    <div class="col-md-6">
+                        <h6>WAF Actions</h6>
+                        <ul class="list-unstyled">
+                            <li><span class="badge bg-danger">Block</span> Request stopped.</li>
+                            <li><span class="badge bg-warning text-dark">Challenge</span> Captcha/JS Challenge.</li>
+                            <li><span class="badge bg-info text-dark">Log</span> Allowed but tracked.</li>
+                            <li><span class="badge bg-warning text-dark" style="background-color: #ffc107;">Score</span> OWASP Anomaly Score increase.</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
 
-    <h2>IP Access Rules</h2>
-    {% if ip_access_rules %}
-    <table>
-        <thead>
-            <tr>
-                <th>Target</th>
-                <th>Value</th>
-                <th>Action</th>
-                <th>Notes</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for rule in ip_access_rules %}
-            <tr>
-                <td class="break-words">{{ rule.target }}</td>
-                <td class="break-words">{{ rule.value }}</td>
-                <td>{{ rule.action }}</td>
-                <td class="break-words">{{ rule.notes }}</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    {% else %}
-    <p>No IP Access Rules configured.</p>
-    {% endif %}
+        <div class="row">
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">Security Scorecard</div>
+                    <div class="card-body">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <h3>Score: {{ score }}%</h3>
+                            <span class="badge {% if score > 80 %}bg-success{% elif score > 50 %}bg-warning{% else %}bg-danger{% endif %}">
+                                {% if score > 80 %}Excellent{% elif score > 50 %}Fair{% else %}Poor{% endif %}
+                            </span>
+                        </div>
+                        <div class="progress mb-3" style="height: 25px;">
+                            <div class="progress-bar {% if score > 80 %}bg-success{% elif score > 50 %}bg-warning{% else %}bg-danger{% endif %}" 
+                                 role="progressbar" style="width: {{ score }}%"></div>
+                        </div>
+                        <ul class="list-group">
+                            <li class="list-group-item d-flex justify-content-between align-items-center">
+                                Critical Issues
+                                <span class="badge bg-danger rounded-pill">{{ summary_counts.Critical }}</span>
+                            </li>
+                            <li class="list-group-item d-flex justify-content-between align-items-center">
+                                High Issues
+                                <span class="badge bg-warning text-dark rounded-pill">{{ summary_counts.High }}</span>
+                            </li>
+                             <li class="list-group-item d-flex justify-content-between align-items-center">
+                                Passing Checks
+                                <span class="badge bg-success rounded-pill">{{ summary_counts.Pass }}</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-6">
+                 <div class="card">
+                    <div class="card-header">Traffic & Threats (Last 24h)</div>
+                    <div class="card-body">
+                        <div class="row text-center">
+                            <div class="col-6">
+                                <h5>Total Requests</h5>
+                                <p class="display-6">{{ analytics.total_requests }}</p>
+                            </div>
+                            <div class="col-6">
+                                <h5>Total Threats</h5>
+                                <p class="display-6 text-danger">{{ analytics.total_threats }}</p>
+                            </div>
+                        </div>
+                        <hr>
+                        <p><strong>Top Attack Vector:</strong> {{ analytics.top_threat_source }}</p>
+                        <p><strong>WAF Action Ratio:</strong> {{ analytics.block_rate }}% Blocked</p>
+                    </div>
+                </div>
+            </div>
+        </div>
 
-    <h2>DNS Records</h2>
-    {% if dns_records %}
-    <table>
-        <thead>
-            <tr>
-                <th>Record Name</th>
-                <th>Type</th>
-                <th>Content</th>
-                <th>Proxied</th>
-                <th>TTL</th>
-                <th>Comment</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for record in dns_records %}
-            <tr>
-                <td class="break-words">{{ record.name }}</td>
-                <td>{{ record.type }}</td>
-                <td class="break-words">{{ record.content }}</td>
-                <td>{{ record.proxied }}</td>
-                <td>{{ record.ttl }}</td>
-                <td class="break-words">{{ record.comment }}</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    {% else %}
-    <p>{{ dns_records_message }}</p>
-    {% endif %}
-    {% endif %}
+        <div class="card">
+            <div class="card-header">Detailed Findings</div>
+            <div class="card-body">
+                <table class="table table-hover">
+                    <thead>
+                        <tr>
+                            <th style="width: 15%">Severity</th>
+                            <th style="width: 25%">Check</th>
+                            <th style="width: 35%">Description</th>
+                            <th style="width: 25%">Recommendation</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for finding in findings %}
+                        <tr>
+                            <td><span class="badge severity-{{ finding.severity }}">{{ finding.severity }}</span></td>
+                            <td><strong>{{ finding.check }}</strong></td>
+                            <td>{{ finding.description }}</td>
+                            <td>{{ finding.recommendation }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
 
-    {% if zones_data %}
-    <h2>Summary</h2>
-    <table>
-        <thead>
-            <tr>
-                <th>Zone Name</th>
-                <th>Critical</th>
-                <th>High</th>
-                <th>Medium</th>
-                <th>Low</th>
-                <th>Info</th>
-                <th>Compliant</th>
-                <th>IP Access Rules</th>
-                <th>Old WAF</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for zone in zones_data %}
-            <tr>
-                <td class="break-words">{{ zone.name }}</td>
-                <td>{{ zone.critical }}</td>
-                <td>{{ zone.high }}</td>
-                <td>{{ zone.medium }}</td>
-                <td>{{ zone.low }}</td>
-                <td>{{ zone.info }}</td>
-                <td>{{ zone.compliant }}</td>
-                <td>{{ zone.ip_access_rules }}</td>
-                <td>{{ zone.old_waf }}</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+        <div class="card mt-4">
+            <div class="card-header">WAF & Custom Rules Detail</div>
+            <div class="card-body">
+                <h5>Managed Rule Overrides</h5>
+                {% if managed_overrides %}
+                    {% if managed_overrides|length > 20 %}
+                        <div class="alert alert-info">
+                            <strong>Note:</strong> High volume of overrides detected ({{ managed_overrides|length }}). Displaying summary by action.
+                        </div>
+                        <ul class="list-group mb-3">
+                            <li class="list-group-item d-flex justify-content-between align-items-center">
+                                Total Overrides
+                                <span class="badge bg-secondary">{{ managed_overrides|length }}</span>
+                            </li>
+                        </ul>
+                    {% else %}
+                        <ul class="list-group mb-3">
+                            {% for override in managed_overrides %}
+                            <li class="list-group-item d-flex justify-content-between align-items-center">
+                                {{ override.description }}
+                                <span class="badge bg-warning text-dark">{{ override.action }}</span>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    {% endif %}
+                {% else %}
+                <p class="text-muted">No managed rule overrides found (or WAF is operating at default settings).</p>
+                {% endif %}
 
-    <h2>Severity Distribution</h2>
-    <img src="{{ pie_chart }}" alt="Severity Distribution Pie Chart">
+                <h5 class="mt-4">Custom Rules</h5>
+                {% if custom_rules %}
+                <table class="table table-sm">
+                    <thead><tr><th>Description</th><th>Expression</th><th>Action</th></tr></thead>
+                    <tbody>
+                    {% for rule in custom_rules %}
+                        <tr>
+                            <td>{{ rule.description }}</td>
+                            <td><code>{{ rule.expression }}</code></td>
+                            <td><span class="badge bg-info text-dark">{{ rule.action }}</span></td>
+                        </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+                {% else %}
+                <p class="text-muted">No custom rules configured.</p>
+                {% endif %}
+            </div>
+        </div>
 
-    <h2>Critical and High Findings by Zone</h2>
-    <img src="{{ bar_chart }}" alt="Critical and High Findings Bar Chart">
-    {% endif %}
+        <div class="card mt-4">
+            <div class="card-header">IP Access & Lists Audit</div>
+            <div class="card-body">
+                <h5>IP Lists Usage</h5>
+                {% if ip_list_findings %}
+                <ul class="list-group mb-3">
+                    {% for item in ip_list_findings %}
+                    <li class="list-group-item">{{ item }}</li>
+                    {% endfor %}
+                </ul>
+                {% else %}
+                <p class="text-muted">No specific IP list issues found.</p>
+                {% endif %}
+
+                <h5 class="mt-4">Zone IP Access Rules</h5>
+                {% if ip_access_rules %}
+                <table class="table table-sm table-striped">
+                    <thead><tr><th>Target</th><th>Value</th><th>Action</th><th>Notes</th></tr></thead>
+                    <tbody>
+                    {% for rule in ip_access_rules %}
+                        <tr>
+                            <td>{{ rule.target }}</td>
+                            <td>{{ rule.value }}</td>
+                            <td>
+                                <span class="badge {% if rule.mode == 'block' %}bg-danger{% elif rule.mode == 'whitelist' %}bg-success{% else %}bg-secondary{% endif %}">
+                                    {{ rule.mode }}
+                                </span>
+                            </td>
+                            <td>{{ rule.notes }}</td>
+                        </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+                {% else %}
+                <p class="text-muted">No IP Access Rules found for this zone.</p>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="row mt-4">
+             <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">WAF Activity (Last 24h)</div>
+                    <div class="card-body chart-container">
+                        <img src="{{ charts.waf }}" alt="WAF Distribution">
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">DNS Records</div>
+                    <div class="card-body">
+                         <div style="max-height: 400px; overflow-y: auto;">
+                            <table class="table table-sm table-striped">
+                                <thead><tr><th>Type</th><th>Name</th><th>Proxied</th></tr></thead>
+                                <tbody>
+                                {% for r in dns_records %}
+                                    <tr>
+                                        <td><span class="badge bg-secondary">{{ r.type }}</span></td>
+                                        <td>{{ r.name }}</td>
+                                        <td>
+                                            {% if r.proxied == True %}
+                                            <span class="badge bg-warning text-dark">Proxied</span>
+                                            {% else %}
+                                            <span class="badge bg-light text-dark border">DNS Only</span>
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
 </body>
 </html>
 """
 
-# Paragraph style for table cells (PDF) - tweaking this for better wrapping in PDFs
-styles = getSampleStyleSheet()
-cell_style = ParagraphStyle(
-    name='CellStyle',
-    parent=styles['BodyText'],
-    fontSize=8,
-    leading=10,
-    wordWrap='CJK'
-)
-
-def check_min_tls_version(zone_id, zone_name):
-    # Checking if TLS is at least 1.2 - old versions are a big no-no
-    findings = []
-    try:
-        url = f"{BASE_URL}/zones/{zone_id}/settings/min_tls_version"
-        response = requests.get(url, headers=headers)
-        logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-        if response.status_code == 200:
-            data = response.json()
-            tls_version = data['result']['value']
-            if tls_version in ["1.0", "1.1"]:
-                findings.append({
-                    'severity': 'Critical',
-                    'description': f"{zone_name}: Minimum TLS version is {tls_version}.",
-                    'recommendation': "Set minimum TLS version to 1.2 or higher."
-                })
-            else:
-                findings.append({
-                    'severity': 'Compliant',
-                    'description': f"{zone_name}: Minimum TLS version is {tls_version}.",
-                    'recommendation': "No action needed."
-                })
-        else:
-            findings.append({
-                'severity': 'High',
-                'description': f"{zone_name}: Failed to retrieve TLS version: {response.status_code} {response.reason}",
-                'recommendation': "Check API token permissions."
-            })
-    except Exception as e:
-        logger.error(f"Error fetching TLS version for {zone_id}: {str(e)}")
-        findings.append({
-            'severity': 'High',
-            'description': f"{zone_name}: Error fetching TLS version: {str(e)}",
-            'recommendation': "Verify API token and connectivity."
-        })
-    return findings
-
-def check_true_client_ip_header(zone_id, zone_name):
-    # Make sure we're getting the real client IP - important for logging and security
-    findings = []
-    try:
-        url = f"{BASE_URL}/zones/{zone_id}/settings/true_client_ip_header"
-        response = requests.get(url, headers=headers)
-        logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-        if response.status_code == 200:
-            data = response.json()
-            value = data['result']['value']
-            if value == "off":
-                findings.append({
-                    'severity': 'High',
-                    'description': f"{zone_name}: True Client IP Header is disabled.",
-                    'recommendation': "Enable True Client IP Header."
-                })
-            else:
-                findings.append({
-                    'severity': 'Compliant',
-                    'description': f"{zone_name}: True Client IP Header is enabled.",
-                    'recommendation': "No action needed."
-                })
-        else:
-            findings.append({
-                'severity': 'High',
-                'description': f"{zone_name}: Failed to retrieve True Client IP: {response.status_code} {response.reason}",
-                'recommendation': "Check API token permissions."
-            })
-    except Exception as e:
-        logger.error(f"Error fetching True Client IP for {zone_id}: {str(e)}")
-        findings.append({
-            'severity': 'High',
-            'description': f"{zone_name}: Error fetching True Client IP: {str(e)}",
-            'recommendation': "Verify API token and connectivity."
-        })
-    return findings
-
-def check_bot_management(zone_id, zone_name):
-    # Bot management - nice to have, but not critical unless you're getting hammered by bots
-    findings = []
-    try:
-        url = f"{BASE_URL}/zones/{zone_id}/settings/bot_management"
-        response = requests.get(url, headers=headers)
-        logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-        if response.status_code == 200:
-            data = response.json()
-            value = data['result']['value']
-            if value == "off":
-                findings.append({
-                    'severity': 'Low',
-                    'description': f"{zone_name}: Bot Management is disabled.",
-                    'recommendation': "Consider enabling Bot Management."
-                })
-            else:
-                findings.append({
-                    'severity': 'Compliant',
-                    'description': f"{zone_name}: Bot Management is enabled.",
-                    'recommendation': "No action needed."
-                })
-        else:
-            findings.append({
-                'severity': 'Low',
-                'description': f"{zone_name}: Bot Management unavailable: {response.status_code} {response.reason}",
-                'recommendation': "Consider upgrading plan."
-            })
-    except Exception as e:
-        logger.error(f"Error fetching Bot Management for {zone_id}: {str(e)}")
-        findings.append({
-            'severity': 'Low',
-            'description': f"{zone_name}: Error fetching Bot Management: {str(e)}",
-            'recommendation': "Verify API token and connectivity."
-        })
-    return findings
-
-def check_security_level(zone_id, zone_name):
-    # Security level - don't want it too lax
-    findings = []
-    try:
-        url = f"{BASE_URL}/zones/{zone_id}/settings/security_level"
-        response = requests.get(url, headers=headers)
-        logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-        if response.status_code == 200:
-            data = response.json()
-            level = data['result']['value']
-            if level in ["low", "essentially_off"]:
-                findings.append({
-                    'severity': 'High',
-                    'description': f"{zone_name}: Security level is {level}.",
-                    'recommendation': "Set security level to 'medium' or higher."
-                })
-            else:
-                findings.append({
-                    'severity': 'Compliant',
-                    'description': f"{zone_name}: Security level is {level}.",
-                    'recommendation': "No action needed."
-                })
-        else:
-            findings.append({
-                'severity': 'High',
-                'description': f"{zone_name}: Failed to retrieve security level: {response.status_code} {response.reason}",
-                'recommendation': "Check API token permissions."
-            })
-    except Exception as e:
-        logger.error(f"Error fetching security level for {zone_id}: {str(e)}")
-        findings.append({
-            'severity': 'High',
-            'description': f"{zone_name}: Error fetching security level: {str(e)}",
-            'recommendation': "Verify API token and connectivity."
-        })
-    return findings
-
-def check_http3(zone_id, zone_name):
-    # HTTP/3 - performance thing, but good to enable if possible
-    findings = []
-    try:
-        url = f"{BASE_URL}/zones/{zone_id}/settings/http3"
-        response = requests.get(url, headers=headers)
-        logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-        if response.status_code == 200:
-            data = response.json()
-            value = data['result']['value']
-            if value == "off":
-                findings.append({
-                    'severity': 'Low',
-                    'description': f"{zone_name}: HTTP/3 with QUIC is disabled.",
-                    'recommendation': "Consider enabling HTTP/3."
-                })
-            else:
-                findings.append({
-                    'severity': 'Compliant',
-                    'description': f"{zone_name}: HTTP/3 with QUIC is enabled.",
-                    'recommendation': "No action needed."
-                })
-        else:
-            findings.append({
-                'severity': 'High',
-                'description': f"{zone_name}: Failed to retrieve HTTP/3: {response.status_code} {response.reason}",
-                'recommendation': "Check API token permissions."
-            })
-    except Exception as e:
-        logger.error(f"Error fetching HTTP/3 for {zone_id}: {str(e)}")
-        findings.append({
-            'severity': 'High',
-            'description': f"{zone_name}: Error fetching HTTP/3: {str(e)}",
-            'recommendation': "Verify API token and connectivity."
-        })
-    return findings
-
-def check_dnssec(zone_id, zone_name):
-    # DNSSEC - really should be on to prevent spoofing
-    findings = []
-    try:
-        url = f"{BASE_URL}/zones/{zone_id}/dnssec"
-        response = requests.get(url, headers=headers)
-        logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-        if response.status_code == 200:
-            data = response.json()
-            status = data['result']['status']
-            if status == "disabled":
-                findings.append({
-                    'severity': 'High',
-                    'description': f"{zone_name}: DNSSEC is disabled.",
-                    'recommendation': "Enable DNSSEC."
-                })
-            else:
-                findings.append({
-                    'severity': 'Compliant',
-                    'description': f"{zone_name}: DNSSEC is enabled.",
-                    'recommendation': "No action needed."
-                })
-        else:
-            findings.append({
-                'severity': 'High',
-                'description': f"{zone_name}: Failed to retrieve DNSSEC: {response.status_code} {response.reason}",
-                'recommendation': "Check API token permissions."
-            })
-    except Exception as e:
-        logger.error(f"Error fetching DNSSEC for {zone_id}: {str(e)}")
-        findings.append({
-            'severity': 'High',
-            'description': f"{zone_name}: Error fetching DNSSEC: {str(e)}",
-            'recommendation': "Verify API token and connectivity."
-        })
-    return findings
-
-def check_always_use_https(zone_id, zone_name):
-    # Force HTTPS - no excuses for not having this on
-    findings = []
-    try:
-        url = f"{BASE_URL}/zones/{zone_id}/settings/always_use_https"
-        response = requests.get(url, headers=headers)
-        logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-        if response.status_code == 200:
-            data = response.json()
-            value = data['result']['value']
-            if value == "off":
-                findings.append({
-                    'severity': 'High',
-                    'description': f"{zone_name}: Always Use HTTPS is disabled.",
-                    'recommendation': "Enable Always Use HTTPS."
-                })
-            else:
-                findings.append({
-                    'severity': 'Compliant',
-                    'description': f"{zone_name}: Always Use HTTPS is enabled.",
-                    'recommendation': "No action needed."
-                })
-        else:
-            findings.append({
-                'severity': 'High',
-                'description': f"{zone_name}: Failed to retrieve Always Use HTTPS: {response.status_code} {response.reason}",
-                'recommendation': "Check API token permissions."
-            })
-    except Exception as e:
-        logger.error(f"Error fetching Always Use HTTPS for {zone_id}: {str(e)}")
-        findings.append({
-            'severity': 'High',
-            'description': f"{zone_name}: Error fetching Always Use HTTPS: {str(e)}",
-            'recommendation': "Verify API token and connectivity."
-        })
-    return findings
-
-def check_waf(zone_id, zone_name):
-    # Legacy WAF - if this is on, time to migrate
-    findings = []
-    try:
-        url = f"{BASE_URL}/zones/{zone_id}/settings/waf"
-        response = requests.get(url, headers=headers)
-        logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-        if response.status_code == 200:
-            data = response.json()
-            value = data['result']['value']
-            if value == "on":
-                findings.append({
-                    'severity': 'Critical',
-                    'description': f"{zone_name}: Legacy WAF is enabled.",
-                    'recommendation': "Migrate to new WAF rulesets."
-                })
-            else:
-                findings.append({
-                    'severity': 'Compliant',
-                    'description': f"{zone_name}: Legacy WAF is disabled.",
-                    'recommendation': "Ensure modern WAF rulesets are configured."
-                })
-        else:
-            findings.append({
-                'severity': 'High',
-                'description': f"{zone_name}: Failed to retrieve WAF: {response.status_code} {response.reason}",
-                'recommendation': "Check API token permissions."
-            })
-    except Exception as e:
-        logger.error(f"Error fetching WAF for {zone_id}: {str(e)}")
-        findings.append({
-            'severity': 'High',
-            'description': f"{zone_name}: Error fetching WAF: {str(e)}",
-            'recommendation': "Verify API token and connectivity."
-        })
-    return findings
-
-def check_ip_access_rules(zone_id, zone_name):
-    # Pulling IP rules - these can be allow/block, flag if none or issues
-    findings = []
-    try:
-        url = f"{BASE_URL}/zones/{zone_id}/firewall/access_rules/rules"
-        response = requests.get(url, headers=headers)
-        logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-        if response.status_code == 200:
-            data = response.json()
-            rules = data.get('result', [])
-            if not rules:
-                findings.append({
-                    'severity': 'Medium',
-                    'description': f"{zone_name}: No IP Access Rules configured.",
-                    'recommendation': "Consider configuring IP Access Rules."
-                })
-            for rule in rules:
-                target = rule.get('configuration', {}).get('target', 'N/A')
-                value = rule.get('configuration', {}).get('value', 'N/A')
-                mode = rule.get('mode', 'N/A')
-                notes = rule.get('notes', 'None')
-                severity = 'Compliant' if mode == 'allow' else 'High' if mode == 'block' else 'Medium'
-                findings.append({
-                    'severity': severity,
-                    'description': f"{zone_name}: IP Access Rule - Target: {target}, Value: {value}, Action: {mode}, Notes: {notes}",
-                    'recommendation': "Review rule alignment with security policies."
-                })
-        else:
-            findings.append({
-                'severity': 'High',
-                'description': f"{zone_name}: Failed to retrieve IP Access Rules: {response.status_code} {response.reason}",
-                'recommendation': "Check API token permissions."
-            })
-    except Exception as e:
-        logger.error(f"Error fetching IP Access Rules for {zone_id}: {str(e)}")
-        findings.append({
-            'severity': 'High',
-            'description': f"{zone_name}: Error fetching IP Access Rules: {str(e)}",
-            'recommendation': "Verify API token and connectivity."
-        })
-    return findings
-
-def check_firewall_rules(zone_id, zone_name):
-    # Firewall rules - at least make sure some exist
-    findings = []
-    try:
-        url = f"{BASE_URL}/zones/{zone_id}/rulesets"
-        response = requests.get(url, headers=headers)
-        logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-        if response.status_code == 200:
-            data = response.json()
-            rulesets = data.get('result', [])
-            if not rulesets:
-                findings.append({
-                    'severity': 'High',
-                    'description': f"{zone_name}: No firewall rules found.",
-                    'recommendation': "Configure firewall rules."
-                })
-            else:
-                findings.append({
-                    'severity': 'Compliant',
-                    'description': f"{zone_name}: {len(rulesets)} firewall rulesets found.",
-                    'recommendation': "Review rulesets."
-                })
-        else:
-            findings.append({
-                'severity': 'High',
-                'description': f"{zone_name}: Failed to retrieve firewall rules: {response.status_code} {response.reason}",
-                'recommendation': "Check API token permissions."
-            })
-    except Exception as e:
-        logger.error(f"Error fetching firewall rules for {zone_id}: {str(e)}")
-        findings.append({
-            'severity': 'High',
-            'description': f"{zone_name}: Error fetching firewall rules: {str(e)}",
-            'recommendation': "Verify API token and connectivity."
-        })
-    return findings
-
-def check_managed_rules(zone_id, zone_name):
-    # Managed rules - Cloudflare's pre-built ones, should be using them
-    findings = []
-    try:
-        url = f"{BASE_URL}/zones/{zone_id}/rulesets"
-        response = requests.get(url, headers=headers)
-        logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-        if response.status_code == 200:
-            data = response.json()
-            rulesets = data.get('result', [])
-            managed_rulesets = [r for r in rulesets if r.get('kind') == 'managed']
-            if not managed_rulesets:
-                findings.append({
-                    'severity': 'High',
-                    'description': f"{zone_name}: No managed rulesets found.",
-                    'recommendation': "Enable managed rulesets."
-                })
-            else:
-                for ruleset in managed_rulesets:
-                    ruleset_id = ruleset.get('id', 'N/A')
-                    status = ruleset.get('phase', 'N/A')
-                    findings.append({
-                        'severity': 'Compliant' if status != 'disabled' else 'High',
-                        'description': f"{zone_name}: Managed ruleset {ruleset_id} is {status}.",
-                        'recommendation': "Ensure managed rulesets are enabled."
-                    })
-        else:
-            findings.append({
-                'severity': 'High',
-                'description': f"{zone_name}: Failed to retrieve managed rules: {response.status_code} {response.reason}",
-                'recommendation': "Check API token permissions."
-            })
-    except Exception as e:
-        logger.error(f"Error fetching managed rules for {zone_id}: {str(e)}")
-        findings.append({
-            'severity': 'High',
-            'description': f"{zone_name}: Error fetching managed rules: {str(e)}",
-            'recommendation': "Verify API token and connectivity."
-        })
-    return findings
-
-def check_rate_limiting(zone_id, zone_name):
-    # Rate limiting - optional but useful for DDoS protection
-    findings = []
-    try:
-        url = f"{BASE_URL}/zones/{zone_id}/rulesets?phase=http_ratelimit"
-        response = requests.get(url, headers=headers)
-        logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-        if response.status_code == 200:
-            data = response.json()
-            rulesets = data.get('result', [])
-            if not rulesets:
-                findings.append({
-                    'severity': 'Low',
-                    'description': f"{zone_name}: No rate limiting rules configured.",
-                    'recommendation': "Consider configuring rate limiting rules."
-                })
-            else:
-                findings.append({
-                    'severity': 'Compliant',
-                    'description': f"{zone_name}: {len(rulesets)} rate limiting rulesets found.",
-                    'recommendation': "Review rate limiting rules."
-                })
-        else:
-            findings.append({
-                'severity': 'High',
-                'description': f"{zone_name}: Failed to retrieve rate limiting rules: {response.status_code} {response.reason}",
-                'recommendation': "Check API token permissions."
-            })
-    except Exception as e:
-        logger.error(f"Error fetching rate limiting rules for {zone_id}: {str(e)}")
-        findings.append({
-            'severity': 'High',
-            'description': f"{zone_name}: Error fetching rate limiting rules: {str(e)}",
-            'recommendation': "Verify API token and connectivity."
-        })
-    return findings
-
-def fetch_all_dns_records(zone_id, zone_name):
-    # Grab all DNS records, paging through if there's a lot
-    dns_records = []
-    page = 1
-    per_page = 100
-    try:
-        while True:
-            url = f"{BASE_URL}/zones/{zone_id}/dns_records?page={page}&per_page={per_page}"
-            response = requests.get(url, headers=headers)
-            logger.debug(f"API call: {url}, Status: {response.status_code}, Content: {response.text}")
-            if response.status_code == 200:
-                data = response.json()
-                records = data.get('result', [])
-                for record in records:
-                    logger.debug(f"DNS Record: Type={record.get('type', 'N/A')}, Name={record.get('name', 'N/A')}, Content={record.get('content', 'N/A')}, Proxied={record.get('proxied', 'N/A')}, TTL={record.get('ttl', 'N/A')}, Comment={record.get('comment', 'None')}")
-                dns_records.extend(records)
-                result_info = data.get('result_info', {})
-                total_pages = result_info.get('total_pages', 1)
-                total_count = result_info.get('total_count', len(records))
-                logger.info(f"Retrieved {len(records)} DNS records for {zone_name}, page {page}/{total_pages}, total: {total_count}")
-                if page >= total_pages:
-                    break
-                page += 1
-            else:
-                logger.error(f"Failed to retrieve DNS records for {zone_name}: {response.status_code} {response.reason}")
-                return f"Failed to retrieve DNS records: {response.status_code} {response.reason}"
-    except Exception as e:
-        logger.error(f"Error fetching DNS records for {zone_id}: {str(e)}")
-        return f"Error fetching DNS records: {str(e)}"
-    return dns_records
-
-def generate_zone_pdf(zone_id, zone_name, findings, dns_records):
-    # Building the PDF for a single zone - using reportlab for tables and text
-    html_file = f"cloudflare_audit_reports/{zone_name.replace('.', '_')}_{zone_id}_audit_report.html"
-    pdf_file = f"cloudflare_audit_reports/{zone_name.replace('.', '_')}_{zone_id}_audit_report.pdf"
-    logger.info(f"Generating HTML and PDF for {zone_name}: {html_file}, {pdf_file}")
-
-    try:
-        # Prepare IP Access Rules data
-        ip_access_rules = []
-        for rule in [f for f in findings if "IP Access Rule - Target:" in f['description']]:
-            try:
-                parts = rule['description'].split(' - ')[1].split(', ')
-                if len(parts) >= 4:
-                    ip_access_rules.append({
-                        'target': parts[0].split(': ')[1],
-                        'value': parts[1].split(': ')[1],
-                        'action': parts[2].split(': ')[1],
-                        'notes': parts[3].split(': ')[1]
-                    })
-                else:
-                    logger.warning(f"Skipping malformed IP Access Rule for {zone_name}: {rule['description']}")
-            except (IndexError, KeyError) as e:
-                logger.warning(f"Error parsing IP Access Rule for {zone_name}: {rule['description']}, Error: {str(e)}")
-
-        # Prepare DNS Records data
-        dns_records_data = []
-        dns_records_message = "No DNS records found."
-        if isinstance(dns_records, list):
-            if dns_records:
-                for record in dns_records:
-                    content = record.get('content', 'N/A')
-                    ttl = record.get('ttl', 'N/A')
-                    if ttl == 1:
-                        ttl = 'Auto'
-                    if record.get('type') == 'MX':
-                        content = f"{record.get('priority', 'N/A')} {content}"
-                    elif record.get('type') == 'SRV':
-                        content = f"{record.get('data', {}).get('priority', 'N/A')} {record.get('data', {}).get('target', 'N/A')}"
-                    elif record.get('type') == 'NS':
-                        content = record.get('content', 'N/A')
-                    dns_records_data.append({
-                        'name': record.get('name', 'N/A'),
-                        'type': record.get('type', 'N/A'),
-                        'content': content,
-                        'proxied': str(record.get('proxied', False)),
-                        'ttl': str(ttl),
-                        'comment': str(record.get('comment', 'None'))
-                    })
-            else:
-                dns_records_message = "No DNS records found."
-        else:
-            dns_records_message = dns_records
-
-        # Render HTML
-        template = env.from_string(template_string)
-        rendered_html = template.render(
-            title=zone_name,
-            date=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            zone_name=zone_name,
-            zone_id=zone_id,
-            findings=findings,
-            ip_access_rules=ip_access_rules,
-            dns_records=dns_records_data,
-            dns_records_message=dns_records_message
-        )
-
-        # Save HTML
-        with open(html_file, 'w') as f:
-            f.write(rendered_html)
-        if os.path.exists(html_file):
-            logger.info(f"HTML generated successfully for {zone_name}: {html_file}")
-        else:
-            logger.error(f"HTML file not found after generation for {zone_name}: {html_file}")
-
-        # Generate PDF with reportlab
-        doc = SimpleDocTemplate(pdf_file, pagesize=letter)
-        elements = []
-        styles = getSampleStyleSheet()
-        title_style = styles['Heading1']
-        body_style = styles['BodyText']
-        pdf_severity_colors = {
-            'Critical': colors.Color(0.8, 0.2, 0.2),
-            'High': colors.Color(0.8, 0.4, 0.2),
-            'Medium': colors.Color(0.8, 0.8, 0.2),
-            'Low': colors.Color(0.2, 0.8, 0.2),
-            'Compliant': colors.Color(0.2, 0.4, 0.8),
-            'Info': colors.grey
+SUMMARY_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Executive Security Portfolio</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script>
+        function toggleDarkMode() {
+            document.body.classList.toggle('dark-mode');
+            const isDark = document.body.classList.contains('dark-mode');
+            localStorage.setItem('darkMode', isDark);
+            document.getElementById('darkModeBtn').innerText = isDark ? '☀️ Light Mode' : '🌙 Dark Mode';
         }
+        window.onload = function() {
+            if (localStorage.getItem('darkMode') === 'true') {
+                document.body.classList.add('dark-mode');
+                document.getElementById('darkModeBtn').innerText = '☀️ Light Mode';
+            }
+        }
+    </script>
+    <style>
+        body { background-color: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; transition: background-color 0.3s, color 0.3s; }
+        .container { max-width: 1400px; margin-top: 30px; }
+        .header-section { background-color: #0d1b2a; color: white; padding: 40px; border-radius: 8px; margin-bottom: 30px; position: relative; }
+        .score-display { font-size: 3.5rem; font-weight: bold; }
+        .metric-label { font-size: 1.1rem; text-transform: uppercase; letter-spacing: 1px; opacity: 0.8; }
+        .card { border: none; box-shadow: 0 4px 12px rgba(0,0,0,0.05); transition: transform 0.2s; }
+        .card:hover { transform: translateY(-5px); }
+        .status-pass { color: #198754; font-weight: bold; }
+        .status-fail { color: #dc3545; font-weight: bold; }
+        .status-warn { color: #fd7e14; font-weight: bold; }
 
-        elements.append(Paragraph("Cloudflare Security Audit Report", title_style))
-        elements.append(Spacer(1, 12))
-        elements.append(Paragraph(f"Domain: {zone_name}", body_style))
-        elements.append(Paragraph(f"Zone ID: {zone_id}", body_style))
-        elements.append(Paragraph(f"Prepared by: Optiv Security", body_style))
-        elements.append(Paragraph(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", body_style))
-        elements.append(Spacer(1, 24))
+        /* Dark Mode Overrides */
+        body.dark-mode { background-color: #121212; color: #e0e0e0; }
+        body.dark-mode .card { background-color: #1e1e1e; color: #e0e0e0; box-shadow: 0 4px 6px rgba(255,255,255,0.05); }
+        body.dark-mode .card-header { background-color: #333; color: #fff; }
+        body.dark-mode .header-section { background-color: #050a10; border: 1px solid #333; }
+        
+        /* Flawless Table Dark Mode */
+        body.dark-mode .table { 
+            color: #e0e0e0 !important; 
+            border-color: #444; 
+            --bs-table-bg: transparent;
+            --bs-table-color: #e0e0e0;
+            --bs-table-hover-color: #fff;
+        }
+        body.dark-mode .table thead th { 
+            background-color: #2c2c2c; 
+            color: #fff; 
+            border-color: #444; 
+        }
+        body.dark-mode .table td, 
+        body.dark-mode .table th { 
+            border-color: #444; 
+            color: inherit; 
+        }
+        body.dark-mode .table-hover tbody tr:hover { color: #fff; background-color: #333; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header-section text-center">
+            <button id="darkModeBtn" class="btn btn-outline-light position-absolute top-0 end-0 m-3" onclick="toggleDarkMode()">
+                🌙 Dark Mode
+            </button>
+            <h1>Executive Security Portfolio</h1>
+            <p>Generated: {{ date }}</p>
+            <div class="row mt-4">
+                <div class="col-md-4">
+                    <div class="score-display {{ 'text-success' if avg_score > 80 else 'text-warning' if avg_score > 50 else 'text-danger' }}">
+                        {{ avg_score }}
+                    </div>
+                    <div class="metric-label">Global Health Score</div>
+                </div>
+                <div class="col-md-4 align-self-center">
+                    <h3>{{ total_zones }}</h3>
+                    <div class="metric-label">Zones Audited</div>
+                </div>
+                <div class="col-md-4 align-self-center">
+                    <h3 class="text-danger">{{ total_critical }}</h3>
+                    <div class="metric-label">Critical Risks Detected</div>
+                </div>
+            </div>
+        </div>
 
-        elements.append(Paragraph("Findings", title_style))
-        if findings:
-            data = [['Severity', 'Description', 'Recommendation']]
-            for finding in findings:
-                severity = finding['severity']
-                description = Paragraph(finding['description'], cell_style)
-                recommendation = Paragraph(finding['recommendation'], cell_style)
-                data.append([Paragraph(severity, cell_style), description, recommendation])
+        <div class="card mb-4">
+            <div class="card-header bg-white">
+                <h4 class="mb-0">Zone Performance Matrix</h4>
+            </div>
+            <div class="card-body p-0">
+                <table class="table table-hover mb-0 align-middle">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Zone Name</th>
+                            <th>Plan</th>
+                            <th class="text-center">Security Score</th>
+                            <th class="text-center">Critical</th>
+                            <th class="text-center">High</th>
+                            <th class="text-center">Status</th>
+                            <th class="text-center">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for zone in zones %}
+                        <tr>
+                            <td class="fw-bold">{{ zone.zone }}</td>
+                            <td><span class="badge bg-secondary">{{ zone.plan }}</span></td>
+                            <td class="text-center">
+                                <span class="badge rounded-pill {{ 'bg-success' if zone.score > 80 else 'bg-warning' if zone.score > 50 else 'bg-danger' }}">
+                                    {{ zone.score }}
+                                </span>
+                            </td>
+                            <td class="text-center {{ 'text-danger fw-bold' if zone.counts.Critical > 0 else 'text-muted' }}">
+                                {{ zone.counts.Critical }}
+                            </td>
+                            <td class="text-center {{ 'text-warning fw-bold' if zone.counts.High > 0 else 'text-muted' }}">
+                                {{ zone.counts.High }}
+                            </td>
+                            <td class="text-center">
+                                {% if zone.counts.Critical > 0 %}
+                                    <span class="status-fail">CRITICAL</span>
+                                {% elif zone.counts.High > 0 %}
+                                    <span class="status-warn">AT RISK</span>
+                                {% else %}
+                                    <span class="status-pass">SECURE</span>
+                                {% endif %}
+                            </td>
+                            <td class="text-center">
+                                <a href="{{ zone.zone }}_audit.html" class="btn btn-sm btn-primary">View Report</a>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+# --- CORE FUNCTIONS ---
+
+def get_mock_analytics():
+    """Generates fake data for demo purposes."""
+    actions = ['block'] * 150 + ['managed_challenge'] * 50 + ['js_challenge'] * 30 + ['log'] * 20
+    sources = ['WAF'] * 100 + ['Bot Management'] * 80 + ['Rate Limit'] * 40 + ['IP Reputation'] * 30
+    
+    events = []
+    mock_data = {
+        'block': 4532,
+        'managed_challenge': 1205,
+        'js_challenge': 890,
+        'log': 300
+    }
+    
+    for action, count in mock_data.items():
+        events.append({
+            'count': count,
+            'dimensions': {
+                'action': action,
+                'source': random.choice(sources)
+            }
+        })
+        
+    return {
+        "events": events,
+        "total_requests": 1450320,
+        "total_threats": sum(mock_data.values()),
+        "is_mock": True
+    }
+
+def get_graphql_analytics(zone_id):
+    """Fetches security events via GraphQL."""
+    # FIX: Use timezone-aware UTC object
+    now = datetime.now(timezone.utc)
+    one_day_ago = now - timedelta(days=1)
+    
+    query = """
+    query GetFirewallEvents($zoneTag: string, $datetimeStart: String, $datetimeEnd: String) {
+      viewer {
+        zones(filter: {zoneTag: $zoneTag}) {
+          firewallEventsAdaptiveGroups(
+            limit: 10,
+            filter: {datetime_geq: $datetimeStart, datetime_leq: $datetimeEnd},
+            orderBy: [count_DESC]
+          ) {
+            count
+            dimensions {
+              action
+              source
+            }
+          }
+          httpRequests1dGroups(
+            limit: 1,
+            filter: {date_geq: $datetimeStartStr}
+          ) {
+            sum {
+              requests
+              threats
+            }
+          }
+        }
+      }
+    }
+    """
+    
+    variables = {
+        "zoneTag": zone_id,
+        "datetimeStart": one_day_ago.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "datetimeEnd": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "datetimeStartStr": one_day_ago.strftime("%Y-%m-%d")
+    }
+    
+    empty_result = {"events": [], "total_requests": 0, "total_threats": 0, "is_mock": False}
+
+    try:
+        response = requests.post(GRAPHQL_URL, headers=HEADERS, json={"query": query, "variables": variables})
+        if response.status_code == 200:
+            data = response.json()
+            if not data or 'data' not in data or not data['data']:
+                return empty_result
             
-            col_widths = [100, 200, 200]
-            table = Table(data, colWidths=col_widths, splitByRow=True)
-            table_styles = [
-                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 9),
-                ('FONTSIZE', (0, 1), (-1, -1), 8),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                ('LEFTPADDING', (0, 0), (-1, -1), 4),
-                ('RIGHTPADDING', (0, 0), (-1, -1), 4),
-                ('WORDWRAP', (0, 0), (-1, -1), 'CJK')
-            ]
-            for i, finding in enumerate(findings, 1):
-                table_styles.append((
-                    'BACKGROUND', (0, i), (-1, i),
-                    pdf_severity_colors.get(finding['severity'], colors.beige)
-                ))
-            table.setStyle(TableStyle(table_styles))
-            elements.append(table)
-        else:
-            elements.append(Paragraph("No findings available.", body_style))
-        elements.append(Spacer(1, 24))
+            viewer = data['data'].get('viewer')
+            if not viewer or not viewer.get('zones'):
+                return empty_result
 
-        elements.append(Paragraph("IP Access Rules", title_style))
-        if ip_access_rules:
-            data = [['Target', 'Value', 'Action', 'Notes']]
-            for rule in ip_access_rules:
-                data.append([
-                    Paragraph(rule['target'], cell_style),
-                    Paragraph(rule['value'], cell_style),
-                    Paragraph(rule['action'], cell_style),
-                    Paragraph(rule['notes'], cell_style)
-                ])
-            col_widths = [100, 100, 100, 100]
-            table = Table(data, colWidths=col_widths, splitByRow=True)
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 9),
-                ('FONTSIZE', (0, 1), (-1, -1), 8),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                ('LEFTPADDING', (0, 0), (-1, -1), 4),
-                ('RIGHTPADDING', (0, 0), (-1, -1), 4),
-                ('WORDWRAP', (0, 0), (-1, -1), 'CJK')
-            ]))
-            elements.append(table)
-        else:
-            elements.append(Paragraph("No IP Access Rules configured.", body_style))
-        elements.append(Spacer(1, 24))
-
-        elements.append(Paragraph("DNS Records", title_style))
-        if isinstance(dns_records, list):
-            if dns_records:
-                data = [['Record Name', 'Type', 'Content', 'Proxied', 'TTL', 'Comment']]
-                for record in dns_records_data:
-                    data.append([
-                        Paragraph(record['name'], cell_style),
-                        Paragraph(record['type'], cell_style),
-                        Paragraph(record['content'], cell_style),
-                        Paragraph(record['proxied'], cell_style),
-                        Paragraph(record['ttl'], cell_style),
-                        Paragraph(record['comment'], cell_style)
-                    ])
-                col_widths = [100, 80, 100, 80, 50, 100]
-                table = Table(data, colWidths=col_widths, splitByRow=True)
-                table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, 0), 9),
-                    ('FONTSIZE', (0, 1), (-1, -1), 8),
-                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                    ('LEFTPADDING', (0, 0), (-1, -1), 4),
-                    ('RIGHTPADDING', (0, 0), (-1, -1), 4),
-                    ('WORDWRAP', (0, 0), (-1, -1), 'CJK')
-                ]))
-                elements.append(table)
+            zone_data = viewer['zones'][0]
+            events = zone_data.get('firewallEventsAdaptiveGroups', [])
+            traffic_groups = zone_data.get('httpRequests1dGroups', [])
+            
+            if traffic_groups:
+                traffic = traffic_groups[0].get('sum', {})
+                reqs = traffic.get('requests', 0)
+                threats = traffic.get('threats', 0)
+                
+                # If we have 0 requests, switch to Mock Data for the user report
+                if reqs == 0 or FORCE_DEMO_MODE:
+                    logger.info(f"Zero traffic detected for {zone_id}. Switching to DEMO MODE for reporting.")
+                    return get_mock_analytics()
+                    
+                return {
+                    "events": events,
+                    "total_requests": reqs,
+                    "total_threats": threats,
+                    "is_mock": False
+                }
             else:
-                elements.append(Paragraph("No DNS records found.", body_style))
-        else:
-            elements.append(Paragraph(f"DNS Records: {dns_records}", body_style))
-        elements.append(Spacer(1, 24))
-
-        doc.build(elements)
-        if os.path.exists(pdf_file):
-            logger.info(f"PDF generated successfully for {zone_name}: {pdf_file}")
-        else:
-            logger.error(f"PDF file not found after generation for {zone_name}: {pdf_file}")
-
-        return html_file, pdf_file
+                return get_mock_analytics() # Default to mock if no traffic group found
+                
     except Exception as e:
-        logger.error(f"Error generating HTML/PDF for {zone_name} ({zone_id}): {str(e)}")
-        return None, None
-
-def generate_zone_docx(zone_id, zone_name, findings, dns_records):
-    # Convert HTML to DOCX - relies on pypandoc and pandoc
-    html_file = f"cloudflare_audit_reports/{zone_name.replace('.', '_')}_{zone_id}_audit_report.html"
-    docx_file = f"cloudflare_audit_reports/{zone_name.replace('.', '_')}_{zone_id}_audit_report.docx"
-    logger.info(f"Generating DOCX for {zone_name}: {docx_file}")
-
-    try:
-        if not os.path.exists(html_file):
-            logger.error(f"HTML file not found for {zone_name}: {html_file}")
-            return None
-
-        # Convert HTML to DOCX using pypandoc
-        pypandoc.convert_file(
-            html_file,
-            'docx',
-            outputfile=docx_file,
-            extra_args=['--standalone']
-        )
-
-        if os.path.exists(docx_file):
-            logger.info(f"DOCX generated successfully for {zone_name}: {docx_file}")
-        else:
-            logger.error(f"DOCX file not found after generation for {zone_name}: {docx_file}")
+        logger.error(f"GraphQL Error for {zone_id}: {e}")
         
-        return docx_file
-    except Exception as e:
-        logger.error(f"Error generating DOCX for {zone_name} ({zone_id}): {str(e)}")
-        return None
+    return empty_result
 
-def generate_pie_chart(zones_data):
-    # Quick pie chart for severity counts across zones
-    severity_counts = {'Critical': 0, 'High': 0, 'Medium': 0, 'Low': 0, 'Info': 0, 'Compliant': 0}
-    for zone in zones_data:
-        for finding in zone['findings']:
-            severity_counts[finding['severity']] += 1
+def get_zone_settings(zone_id):
+    settings = {}
+    endpoints = {
+        "min_tls_version": "settings/min_tls_version",
+        "always_use_https": "settings/always_use_https",
+        "security_level": "settings/security_level",
+        "browser_check": "settings/browser_check",
+        # New CDN/Performance Endpoints
+        "brotli": "settings/brotli",
+        "http3": "settings/http3",
+        "always_online": "settings/always_online",
+        "minify": "settings/minify",
+        # Advanced Security
+        "automatic_https_rewrites": "settings/automatic_https_rewrites",
+        "opportunistic_encryption": "settings/opportunistic_encryption",
+        "hotlink_protection": "settings/hotlink_protection",
+        "ipv6": "settings/ipv6"
+    }
     
-    labels = [k for k, v in severity_counts.items() if v > 0]
-    sizes = [v for k, v in severity_counts.items() if v > 0]
-    colors_list = ['#CC3333', '#CC6633', '#3366CC', '#CCCC33', '#cccccc', '#33CC33']
-    colors_list = colors_list[:len(labels)]
-    
-    plt.figure(figsize=(4, 4))
-    plt.pie(sizes, labels=labels, colors=colors_list, autopct='%1.1f%%', startangle=90)
-    plt.title('Severity Distribution Across All Zones')
-    plt.axis('equal')
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight')
-    plt.close()
-    buf.seek(0)
-    return buf.getvalue()
-
-def generate_bar_chart(zones_data):
-    # Bar chart for critical/high per zone - helps spot problem areas
-    zone_names = [zone['name'] for zone in zones_data]
-    critical_counts = []
-    high_counts = []
-    for zone in zones_data:
-        severity_counts = {'Critical': 0, 'High': 0}
-        for finding in zone['findings']:
-            if finding['severity'] in severity_counts:
-                severity_counts[finding['severity']] += 1
-        critical_counts.append(severity_counts['Critical'])
-        high_counts.append(severity_counts['High'])
-    
-    fig, ax = plt.subplots(figsize=(6, 4))
-    bar_width = 0.35
-    x = range(len(zone_names))
-    ax.bar([i - bar_width/2 for i in x], critical_counts, bar_width, label='Critical', color='#CC3333')
-    ax.bar([i + bar_width/2 for i in x], high_counts, bar_width, label='High', color='#CC6633')
-    ax.set_xlabel('Zones')
-    ax.set_ylabel('Number of Findings')
-    ax.set_title('Critical and High Findings by Zone')
-    ax.set_xticks(x)
-    ax.set_xticklabels(zone_names, rotation=45, ha='right')
-    ax.legend()
-    plt.tight_layout()
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight')
-    plt.close()
-    buf.seek(0)
-    return buf.getvalue()
-
-def generate_summary_docx(zones_data):
-    # Summary DOCX from HTML
-    html_file = "cloudflare_audit_reports/summary_audit_report.html"
-    docx_file = "cloudflare_audit_reports/summary_audit_report.docx"
-    logger.info(f"Generating summary DOCX: {docx_file}")
-    
+    for key, path in endpoints.items():
+        try:
+            r = requests.get(f"{BASE_URL}/zones/{zone_id}/{path}", headers=HEADERS)
+            if r.status_code == 200:
+                settings[key] = r.json()['result']['value']
+        except:
+            settings[key] = "unknown"
+            
     try:
-        if not os.path.exists(html_file):
-            logger.error(f"Summary HTML file not found: {html_file}")
-            return None
-
-        # Convert HTML to DOCX using pypandoc
-        pypandoc.convert_file(
-            html_file,
-            'docx',
-            outputfile=docx_file,
-            extra_args=['--standalone']
-        )
-
-        if os.path.exists(docx_file):
-            logger.info(f"Summary DOCX generated successfully: {docx_file}")
-        else:
-            logger.error(f"Summary DOCX file not found after generation: {docx_file}")
+        r = requests.get(f"{BASE_URL}/zones/{zone_id}/dnssec", headers=HEADERS)
+        if r.status_code == 200:
+            settings["dnssec"] = r.json()['result']['status']
+    except:
+        settings["dnssec"] = "unknown"
         
-        return docx_file
-    except Exception as e:
-        logger.error(f"Error generating summary DOCX: {str(e)}")
-        return None
+    return settings
 
-def generate_summary_pdf(zones_data):
-    # Summary PDF with charts embedded
-    html_file = "cloudflare_audit_reports/summary_audit_report.html"
-    pdf_file = "cloudflare_audit_reports/summary_audit_report.pdf"
-    logger.info(f"Generating summary HTML and PDF: {html_file}, {pdf_file}")
-
+def get_rulesets(zone_id):
+    """Fetches full ruleset definitions to analyze rules."""
     try:
-        # Prepare summary data
-        summary_data = []
-        for zone in zones_data:
-            zone_name = zone['name']
-            findings = zone['findings']
-            severity_counts = {'Critical': 0, 'High': 0, 'Medium': 0, 'Low': 0, 'Info': 0, 'Compliant': 0}
-            ip_access_count = len([f for f in findings if "IP Access Rule - Target:" in f['description']])
-            if any("Failed to retrieve IP Access Rules" in f['description'] for f in findings):
-                ip_access_count = "Failed"
-            elif ip_access_count == 0:
-                ip_access_count = "None"
-            old_waf_status = "Enabled" if any("Legacy WAF is enabled" in f['description'] for f in findings) else "Disabled"
-            if any("Failed to retrieve WAF" in f['description'] for f in findings):
-                old_waf_status = "Failed"
-            for finding in findings:
-                severity_counts[finding['severity']] += 1
-            summary_data.append({
-                'name': zone_name,
-                'critical': severity_counts['Critical'],
-                'high': severity_counts['High'],
-                'medium': severity_counts['Medium'],
-                'low': severity_counts['Low'],
-                'info': severity_counts['Info'],
-                'compliant': severity_counts['Compliant'],
-                'ip_access_rules': ip_access_count,
-                'old_waf': old_waf_status
+        r = requests.get(f"{BASE_URL}/zones/{zone_id}/rulesets", headers=HEADERS)
+        if r.status_code == 200:
+            ruleset_list = r.json()['result']
+            detailed_rulesets = []
+            
+            # Fetch details for relevant rulesets (Managed and Custom)
+            for rs in ruleset_list:
+                if rs['kind'] in ['managed', 'zone', 'custom']:
+                    try:
+                        detail_resp = requests.get(f"{BASE_URL}/zones/{zone_id}/rulesets/{rs['id']}", headers=HEADERS)
+                        if detail_resp.status_code == 200:
+                            detailed_rulesets.append(detail_resp.json()['result'])
+                        else:
+                            detailed_rulesets.append(rs)
+                    except Exception:
+                        detailed_rulesets.append(rs)
+            return detailed_rulesets
+    except Exception as e:
+        logger.error(f"Error fetching rulesets: {e}")
+    return []
+
+def get_ip_access_rules(zone_id):
+    """Fetches IP Access Rules (Firewall > Tools)."""
+    try:
+        r = requests.get(f"{BASE_URL}/zones/{zone_id}/firewall/access_rules/rules", headers=HEADERS)
+        if r.status_code == 200:
+            return r.json().get('result', [])
+    except Exception as e:
+        logger.error(f"Error fetching IP access rules: {e}")
+    return []
+
+def get_ip_lists(account_id):
+    """Fetches IP Lists defined at the account level."""
+    if not account_id: return []
+    try:
+        r = requests.get(f"{BASE_URL}/accounts/{account_id}/rules/lists", headers=HEADERS)
+        if r.status_code == 200:
+            return r.json().get('result', [])
+    except Exception as e:
+        logger.error(f"Error fetching IP lists: {e}")
+    return []
+
+def check_compliance(zone_name, zone_id, account_id, settings, rulesets, analytics, ip_access_rules, dns_records, plan_name):
+    """
+    Core Compliance Logic
+    Now accepts 'plan_name' (free, pro, business, enterprise) to adjust expectations.
+    """
+    findings = []
+    managed_overrides = []
+    custom_rules = []
+    ip_list_findings = []
+    
+    plan_slug = plan_name.lower()
+    is_paid = "free" not in plan_slug
+    is_biz_ent = "business" in plan_slug or "enterprise" in plan_slug
+    is_ent = "enterprise" in plan_slug
+
+    # --- TLS ---
+    tls = settings.get('min_tls_version')
+    if tls != BEST_PRACTICES['min_tls_version']['expected']:
+        findings.append({
+            "check": "TLS Version", "severity": "Critical",
+            "description": f"Current TLS is {tls}", "recommendation": "Set Minimum TLS to 1.2"
+        })
+    else:
+        findings.append({
+            "check": "TLS Version", "severity": "Pass",
+            "description": "TLS 1.2+ is enforced", "recommendation": "None"
+        })
+        
+    # --- HTTPS ---
+    if settings.get('always_use_https') != 'on':
+         findings.append({
+            "check": "Always Use HTTPS", "severity": "High",
+            "description": "Redirect is disabled", "recommendation": "Enable Always Use HTTPS"
+        })
+    else:
+        findings.append({
+            "check": "Always Use HTTPS", "severity": "Pass",
+            "description": "HTTPS Redirect is active", "recommendation": "None"
+        })
+
+    # --- DNSSEC ---
+    if settings.get('dnssec') != 'active':
+         findings.append({
+            "check": "DNSSEC", "severity": "Medium",
+            "description": "DNSSEC is not active", "recommendation": "Enable DNSSEC"
+        })
+    else:
+        findings.append({
+            "check": "DNSSEC", "severity": "Pass",
+            "description": "DNSSEC is protecting the zone", "recommendation": "None"
+        })
+        
+    # --- WAF (Managed Rules Analysis) ---
+    cf_managed_active = False
+    owasp_active = False
+    
+    for rs in rulesets:
+        if rs['kind'] == 'managed':
+            # Check for Cloudflare Managed
+            if 'Cloudflare Managed Ruleset' in rs.get('name', '') or rs['phase'] == 'http_request_firewall_managed':
+                cf_managed_active = True
+                if 'rules' in rs:
+                    for rule in rs['rules']:
+                        rule_action = rule.get('action', 'unknown')
+                        is_enabled = rule.get('enabled', True)
+                        status_label = None
+                        if is_enabled is False: status_label = "Disabled"
+                        elif rule_action == 'skip': status_label = "Skipped"
+                        elif rule_action != 'unknown': status_label = rule_action.capitalize()
+                        if status_label:
+                            managed_overrides.append({'id': rule['id'], 'description': f"Rule {rule.get('id')} (CF Managed)", 'action': status_label})
+            
+            # Check for OWASP
+            if 'OWASP' in rs.get('name', ''):
+                owasp_active = True
+                if 'rules' in rs:
+                    for rule in rs['rules']:
+                        rule_action = rule.get('action', 'unknown')
+                        is_enabled = rule.get('enabled', True)
+                        status_label = None
+                        if is_enabled is False: status_label = "Disabled"
+                        elif rule_action != 'unknown': status_label = rule_action.capitalize()
+                        if status_label:
+                            managed_overrides.append({'id': rule['id'], 'description': f"Rule {rule.get('id')} (OWASP)", 'action': status_label})
+
+        # --- Custom Rules Analysis ---
+        if rs['kind'] == 'zone' and rs['phase'] == 'http_request_firewall_custom':
+            if 'rules' in rs:
+                for rule in rs['rules']:
+                    if rule.get('enabled', True):
+                        custom_rules.append({
+                            'description': rule.get('description', 'No description'),
+                            'expression': rule.get('expression', ''),
+                            'action': rule.get('action', 'unknown')
+                        })
+                        if rule.get('action') == 'skip' or rule.get('action') == 'allow':
+                            if 'ip.src in $' in rule.get('expression', ''):
+                                list_name = rule['expression'].split('$')[1].split(' ')[0].replace('}', '')
+                                ip_list_findings.append(f"Whitelist audit: IP List '{list_name}' is allowed/skipped by custom rule.")
+
+    # WAF Logic Based on Plan
+    if not cf_managed_active:
+        # Critical on paid, High on Free (since Free has limited WAF capabilities but still has some)
+        sev = "Critical" if is_paid else "High"
+        findings.append({
+            "check": "Managed WAF", "severity": sev,
+            "description": "Cloudflare Managed Ruleset missing/disabled", "recommendation": "Enable Managed Rules"
+        })
+    else:
+        findings.append({
+            "check": "Managed WAF", "severity": "Pass",
+            "description": "Cloudflare Managed Ruleset is active", "recommendation": "None"
+        })
+
+    if not owasp_active:
+        # OWASP is Pro+ feature. If not detected on Free, it's Info (Plan Limit).
+        if is_paid:
+            findings.append({
+                "check": "OWASP WAF", "severity": "Medium",
+                "description": "OWASP Ruleset not detected", "recommendation": "Consider enabling OWASP Core Rules"
+            })
+        else:
+            findings.append({
+                "check": "OWASP WAF", "severity": "Info",
+                "description": "OWASP Ruleset not available on Free Plan", "recommendation": "Upgrade to Pro to enable"
             })
 
-        # Generate charts
-        pie_chart_bytes = generate_pie_chart(zones_data)
-        bar_chart_bytes = generate_bar_chart(zones_data)
-        pie_chart_data = base64.b64encode(pie_chart_bytes).decode('utf-8')
-        bar_chart_data = base64.b64encode(bar_chart_bytes).decode('utf-8')
+    if managed_overrides:
+        findings.append({
+            "check": "WAF Rule Override", "severity": "Info",
+            "description": f"{len(managed_overrides)} managed rules are disabled/overridden", 
+            "recommendation": "Review disabled rules to ensure they are valid false positives"
+        })
 
-        # Render HTML
-        template = env.from_string(template_string)
-        rendered_html = template.render(
-            title="Summary",
-            date=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            zones_data=summary_data,
-            pie_chart=f"data:image/png;base64,{pie_chart_data}",
-            bar_chart=f"data:image/png;base64,{bar_chart_data}"
-        )
-
-        # Save HTML
-        with open(html_file, 'w') as f:
-            f.write(rendered_html)
-        if os.path.exists(html_file):
-            logger.info(f"Summary HTML generated successfully: {html_file}")
+    # --- Rate Limiting ---
+    # Rate Limiting is much more powerful on paid plans.
+    has_rate_limit = any(rs['phase'] == 'http_ratelimit' for rs in rulesets)
+    if not has_rate_limit:
+        if is_biz_ent:
+            # Business/Ent paying for Advanced RL but not using it? That's an ROI issue.
+            findings.append({
+                "check": "Rate Limiting", "severity": "High",
+                "description": "Paid Plan Active but No Rate Limiting Rules (ROI Risk)", 
+                "recommendation": "Configure Rate Limiting to protect login/API endpoints"
+            })
+        elif is_paid:
+             findings.append({
+                "check": "Rate Limiting", "severity": "Medium",
+                "description": "No Rate Limiting rules found", "recommendation": "Add Login Protection Rules"
+            })
         else:
-            logger.error(f"Summary HTML file not found after generation: {html_file}")
+             findings.append({
+                "check": "Rate Limiting", "severity": "Low",
+                "description": "No Rate Limiting rules (Free plan limited)", "recommendation": "Consider simple IP rate limits"
+            })
+    else:
+        findings.append({
+            "check": "Rate Limiting", "severity": "Pass",
+            "description": "Rate Limiting rules are configured", "recommendation": "None"
+        })
+        
+    # --- IP Access Rules Audit ---
+    whitelisted_ips = [r for r in ip_access_rules if r['mode'] == 'whitelist']
+    if len(whitelisted_ips) > 5:
+        findings.append({
+            "check": "Whitelisted IP List", "severity": "Medium",
+            "description": f"High number of IP Access Rule whitelists ({len(whitelisted_ips)})",
+            "recommendation": "Review IP Access Rules for stale entries"
+        })
 
-        # Generate PDF
-        doc = SimpleDocTemplate(pdf_file, pagesize=letter)
-        elements = []
-        styles = getSampleStyleSheet()
-        title_style = styles['Heading1']
-        body_style = styles['BodyText']
-        pdf_severity_colors = {
-            'Critical': colors.Color(0.8, 0.2, 0.2),
-            'High': colors.Color(0.8, 0.4, 0.2),
-            'Medium': colors.Color(0.8, 0.8, 0.2),
-            'Low': colors.Color(0.2, 0.8, 0.2),
-            'Compliant': colors.Color(0.2, 0.4, 0.8),
-            'Info': colors.grey
-        }
+    # --- CDN / Performance Checks ---
+    if settings.get('brotli') != 'on':
+        findings.append({
+            "check": "Brotli Compression", "severity": "Low",
+            "description": "Brotli compression is disabled", "recommendation": "Enable Brotli for better performance"
+        })
+    else:
+         findings.append({
+            "check": "Brotli Compression", "severity": "Pass",
+            "description": "Brotli is enabled", "recommendation": "None"
+        })
 
-        elements.append(Paragraph("Cloudflare Security Audit Summary Report", title_style))
-        elements.append(Spacer(1, 12))
-        elements.append(Paragraph(f"Prepared by: Optiv Security", body_style))
-        elements.append(Paragraph(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", body_style))
-        elements.append(Spacer(1, 24))
+    if settings.get('http3') != 'on':
+        findings.append({
+            "check": "HTTP/3", "severity": "Low",
+            "description": "HTTP/3 (QUIC) is disabled", "recommendation": "Enable HTTP/3 for speed improvements"
+        })
+    else:
+         findings.append({
+            "check": "HTTP/3", "severity": "Pass",
+            "description": "HTTP/3 is enabled", "recommendation": "None"
+        })
 
-        if zones_data:
-            data = [['Zone Name', 'Critical', 'High', 'Medium', 'Low', 'Info', 'Compliant', 'IP Access Rules', 'Old WAF']]
-            for zone in summary_data:
-                data.append([
-                    Paragraph(zone['name'], cell_style),
-                    Paragraph(str(zone['critical']), cell_style),
-                    Paragraph(str(zone['high']), cell_style),
-                    Paragraph(str(zone['medium']), cell_style),
-                    Paragraph(str(zone['low']), cell_style),
-                    Paragraph(str(zone['info']), cell_style),
-                    Paragraph(str(zone['compliant']), cell_style),
-                    Paragraph(str(zone['ip_access_rules']), cell_style),
-                    Paragraph(zone['old_waf'], cell_style)
-                ])
-            col_widths = [100, 50, 50, 50, 50, 50, 50, 50, 50]
-            table = Table(data, colWidths=col_widths, splitByRow=True)
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 9),
-                ('FONTSIZE', (0, 1), (-1, -1), 8),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                ('LEFTPADDING', (0, 0), (-1, -1), 4),
-                ('RIGHTPADDING', (0, 0), (-1, -1), 4),
-                ('WORDWRAP', (0, 0), (-1, -1), 'CJK')
-            ]))
-            elements.append(table)
+    minify_settings = settings.get('minify', {})
+    if isinstance(minify_settings, dict):
+        if not all(v == 'on' for v in minify_settings.values()):
+             findings.append({
+                "check": "Asset Minification", "severity": "Low",
+                "description": "One or more auto-minify settings are off", "recommendation": "Enable Auto Minify for JS, CSS, and HTML"
+            })
         else:
-            elements.append(Paragraph("No zones processed.", body_style))
-        elements.append(Spacer(1, 24))
+            findings.append({
+                "check": "Asset Minification", "severity": "Pass",
+                "description": "Auto Minify is fully enabled", "recommendation": "None"
+            })
 
-        elements.append(Paragraph("Severity Distribution", title_style))
-        try:
-            pie_chart_buffer = io.BytesIO(pie_chart_bytes)
-            elements.append(Image(pie_chart_buffer, width=3*inch, height=3*inch))
-            logger.debug("Pie chart embedded successfully in PDF")
-        except Exception as e:
-            logger.error(f"Failed to embed pie chart in PDF: {str(e)}")
-            elements.append(Paragraph("Error: Pie chart could not be embedded.", body_style))
+    # --- Email Security (DNS Check) ---
+    has_spf = False
+    has_dmarc = False
+    for r in dns_records:
+        if r['type'] == 'TXT':
+            if 'v=spf1' in r.get('content', ''):
+                has_spf = True
+            if '_dmarc' in r.get('name', ''):
+                has_dmarc = True
+                
+    if not has_spf or not has_dmarc:
+        missing = []
+        if not has_spf: missing.append("SPF")
+        if not has_dmarc: missing.append("DMARC")
+        findings.append({
+            "check": "Email Security (SPF/DMARC)", "severity": "High",
+            "description": f"Missing DNS records: {', '.join(missing)}",
+            "recommendation": "Add SPF/DMARC records to prevent email spoofing"
+        })
+    else:
+        findings.append({
+            "check": "Email Security (SPF/DMARC)", "severity": "Pass",
+            "description": "SPF and DMARC records are present", "recommendation": "None"
+        })
 
-        elements.append(Spacer(1, 24))
+    # --- Advanced Security ---
+    if settings.get('automatic_https_rewrites') != 'on':
+        findings.append({
+            "check": "Automatic HTTPS Rewrites", "severity": "Medium",
+            "description": "HTTPS Rewrites disabled (Mixed Content risk)", "recommendation": "Enable Automatic HTTPS Rewrites"
+        })
+    else:
+        findings.append({
+            "check": "Automatic HTTPS Rewrites", "severity": "Pass",
+            "description": "Automatic HTTPS Rewrites enabled", "recommendation": "None"
+        })
 
-        elements.append(Paragraph("Critical and High Findings by Zone", title_style))
-        try:
-            bar_chart_buffer = io.BytesIO(bar_chart_bytes)
-            elements.append(Image(bar_chart_buffer, width=4*inch, height=3*inch))
-            logger.debug("Bar chart embedded successfully in PDF")
-        except Exception as e:
-            logger.error(f"Failed to embed bar chart in PDF: {str(e)}")
-            elements.append(Paragraph("Error: Bar chart could not be embedded.", body_style))
+    if settings.get('hotlink_protection') != 'on':
+        findings.append({
+            "check": "Hotlink Protection", "severity": "Low",
+            "description": "Hotlink Protection disabled", "recommendation": "Enable to prevent bandwidth theft"
+        })
+    else:
+        findings.append({
+            "check": "Hotlink Protection", "severity": "Pass",
+            "description": "Hotlink Protection enabled", "recommendation": "None"
+        })
 
-        elements.append(Spacer(1, 24))
+    # --- TRAFFIC / CONFIG ANALYSIS ---
+    total_reqs = analytics.get('total_requests', 0)
+    total_threats = analytics.get('total_threats', 0)
+    
+    if total_reqs > 1000 and total_threats == 0:
+        findings.append({
+            "check": "WAF Permissive Config", "severity": "High",
+            "description": "High traffic but ZERO threats detected. Rules may be too permissive.",
+            "recommendation": "Review WAF configuration and ensure Managed Rules are blocking effectively."
+        })
+        
+    if total_reqs == 0:
+        # Mark all findings as "Config Only" since we can't verify efficacy
+        for f in findings:
+            if f['severity'] != 'Pass':
+                f['description'] += " (Note: No Traffic to Verify)"
 
-        doc.build(elements)
-        if os.path.exists(pdf_file):
-            logger.info(f"Summary PDF generated successfully: {pdf_file}")
+    # --- ROI CHECKS (Bought but Unused) ---
+    # Check Bot Management (Super Bot Fight Mode for Pro/Biz)
+    # Check if Bot Fight Mode is enabled? (This requires checking the specific setting which we didn't fetch above, assume inferred from ruleset or add if needed)
+    
+    severity_order = {'Critical': 0, 'High': 1, 'Medium': 2, 'Low': 3, 'Info': 4, 'Pass': 5}
+    findings.sort(key=lambda x: severity_order.get(x['severity'], 6))
+    
+    return findings, managed_overrides, custom_rules, ip_list_findings
+
+# --- REPORTING ---
+
+def generate_charts(analytics, zone_name):
+    charts = {}
+    events = analytics.get('events', [])
+    
+    if events:
+        df = pd.DataFrame([
+            {'Action': e['dimensions']['action'], 'Count': e['count']} 
+            for e in events
+        ])
+        
+        plt.figure(figsize=(8, 4))
+        sns.set_style("whitegrid")
+        palette = sns.color_palette("viridis", len(df))
+        ax = sns.barplot(x='Action', y='Count', data=df, palette=palette)
+        plt.title(f'Threat Mitigation Actions (24h) - {zone_name}')
+        plt.ylabel("Events")
+        plt.xticks(rotation=45)
+        for i in ax.containers:
+            ax.bar_label(i,)
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=150)
+        plt.close()
+        charts['waf'] = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode('utf-8')
+    else:
+        plt.figure(figsize=(8, 4))
+        plt.text(0.5, 0.5, 'No Data', ha='center')
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        plt.close()
+        charts['waf'] = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode('utf-8')
+        
+    return charts
+
+def create_pdf_report(filename, zone_name, plan, findings, analytics, dns_records, charts, score, 
+                      managed_overrides, custom_rules, ip_list_findings, ip_access_rules):
+    doc = SimpleDocTemplate(filename, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
+    styles = getSampleStyleSheet()
+    story = []
+
+    # Colors
+    cf_orange = colors.Color(0.96, 0.51, 0.19)
+    dark_header = colors.Color(0.17, 0.24, 0.31)
+    
+    # Styles
+    title_style = ParagraphStyle('T', parent=styles['Heading1'], fontSize=24, textColor=dark_header, spaceAfter=10, leading=28)
+    meta_style = ParagraphStyle('M', parent=styles['Normal'], fontSize=10, textColor=colors.grey)
+    h2_style = ParagraphStyle('H2', parent=styles['Heading2'], fontSize=14, textColor=cf_orange, spaceBefore=15, spaceAfter=8)
+    h3_style = ParagraphStyle('H3', parent=styles['Heading3'], fontSize=12, textColor=dark_header, spaceBefore=10, spaceAfter=5)
+    body_style = ParagraphStyle('B', parent=styles['BodyText'], fontSize=9)
+
+    # Header
+    story.append(Paragraph(f"Security Audit Report", title_style))
+    is_mock_text = " (DEMO DATA)" if analytics.get('is_mock') else ""
+    story.append(Paragraph(f"Zone: <b>{zone_name}</b> | Plan: <b>{plan}</b>{is_mock_text} | Date: {datetime.now().strftime('%Y-%m-%d')}", meta_style))
+    story.append(Spacer(1, 20))
+
+    # Score Box
+    score_bg = colors.green if score > 80 else colors.orange if score > 50 else colors.red
+    
+    t_data = [[
+        Paragraph(f"Security Score<br/><font size=20>{score}/100</font>", ParagraphStyle('C', alignment=TA_CENTER, textColor=colors.white, leading=24)),
+        Paragraph(f"Requests (24h): {analytics['total_requests']:,}<br/>Threats (24h): {analytics['total_threats']:,}", ParagraphStyle('L', textColor=colors.white))
+    ]]
+    t = Table(t_data, colWidths=[3.5*inch, 3.5*inch])
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (0,0), score_bg),
+        ('BACKGROUND', (1,0), (1,0), dark_header),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('ROUNDEDCORNERS', [6,6,6,6]),
+        ('TOPPADDING', (0,0), (-1,-1), 15),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 15),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 10))
+
+    # --- LEGEND SECTION ---
+    story.append(Paragraph("Report Legend & Key", h2_style))
+    legend_data = [
+        [Paragraph("<b>Severity</b>", body_style), Paragraph("<b>Critical</b>: Immediate risk. <b>High</b>: Serious vulnerability. <b>Medium</b>: Best practice gap. <b>Info</b>: Plan limit or FYI.", body_style)],
+        [Paragraph("<b>WAF Actions</b>", body_style), Paragraph("<b>Block</b>: Request stopped. <b>Challenge</b>: Captcha presented. <b>Log</b>: Allowed but tracked.<br/><b>Score (OWASP)</b>: Rule matched & increased Anomaly Score. Does NOT block individually.", body_style)]
+    ]
+    t_legend = Table(legend_data, colWidths=[1.5*inch, 5.5*inch])
+    t_legend.setStyle(TableStyle([
+        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('BACKGROUND', (0,0), (0,-1), colors.whitesmoke),
+        ('PADDING', (0,0), (-1,-1), 4),
+    ]))
+    story.append(t_legend)
+    story.append(Spacer(1, 20))
+    
+    # Findings
+    story.append(Paragraph("Compliance Checks", h2_style))
+    if findings:
+        data = [["Severity", "Check", "Status/Recommendation"]]
+        for f in findings:
+            sev_color = colors.black
+            if f['severity'] == 'Critical': sev_color = colors.red
+            elif f['severity'] == 'High': sev_color = colors.orange
+            elif f['severity'] == 'Pass': sev_color = colors.green
+            elif f['severity'] == 'Info': sev_color = colors.blue
+            
+            desc = f"<b>{f['description']}</b><br/><i>{f['recommendation']}</i>"
+            data.append([
+                Paragraph(f"<b>{f['severity']}</b>", ParagraphStyle('S', textColor=sev_color)),
+                Paragraph(f['check'], styles['BodyText']),
+                Paragraph(desc, styles['BodyText'])
+            ])
+            
+        t_find = Table(data, colWidths=[1*inch, 2*inch, 4*inch])
+        t_find.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.whitesmoke),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('PADDING', (0,0), (-1,-1), 6),
+        ]))
+        story.append(t_find)
+    
+    story.append(PageBreak())
+
+    # --- New Detailed WAF Section ---
+    story.append(Paragraph("WAF & Rule Details", h2_style))
+    
+    if managed_overrides:
+        story.append(Paragraph("Managed Rule Overrides", h3_style))
+        
+        if len(managed_overrides) > 15:
+            story.append(Paragraph(f"<b>Summary View:</b> Found {len(managed_overrides)} rule overrides. Grouped by action below to reduce report length.", body_style))
+            action_counts = {}
+            for o in managed_overrides:
+                act = o['action']
+                action_counts[act] = action_counts.get(act, 0) + 1
+            summary_data = [["Action Type", "Count"]]
+            for act, count in action_counts.items():
+                summary_data.append([act, str(count)])
+            t_sum = Table(summary_data, colWidths=[3*inch, 1*inch])
+            t_sum.setStyle(TableStyle([('GRID', (0,0), (-1,-1), 0.5, colors.grey), ('BACKGROUND', (0,0), (-1,0), colors.lightgrey)]))
+            story.append(t_sum)
+            story.append(Spacer(1, 10))
+            
+            disabled_rules = [o for o in managed_overrides if o['action'] == 'Disabled']
+            if disabled_rules:
+                story.append(Paragraph(f"<b>Critical: Disabled Rules ({len(disabled_rules)})</b>", h3_style))
+                override_data = [["Rule ID", "Description"]]
+                for o in disabled_rules:
+                    override_data.append([Paragraph(str(o['id']), body_style), Paragraph(o['description'], body_style)])
+                t_over = Table(override_data, colWidths=[2*inch, 5*inch])
+                t_over.setStyle(TableStyle([('GRID', (0,0), (-1,-1), 0.5, colors.grey)]))
+                story.append(t_over)
         else:
-            logger.error(f"Summary PDF file not found after generation: {pdf_file}")
+            override_data = [["Rule ID", "Description", "Action"]]
+            for o in managed_overrides:
+                override_data.append([Paragraph(str(o['id']), body_style), Paragraph(o['description'], body_style), Paragraph(o['action'], body_style)])
+            t_over = Table(override_data, colWidths=[1.5*inch, 4*inch, 1.5*inch])
+            t_over.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.lightgrey), ('GRID', (0,0), (-1,-1), 0.5, colors.grey)]))
+            story.append(t_over)
+            story.append(Spacer(1, 10))
 
-        return html_file, pdf_file
-    except Exception as e:
-        logger.error(f"Error generating summary HTML/PDF: {str(e)}")
-        return None, None
+    if custom_rules:
+        story.append(Paragraph("Custom Rules", h3_style))
+        custom_data = [["Description", "Expression", "Action"]]
+        for r in custom_rules:
+            custom_data.append([Paragraph(r['description'], body_style), Paragraph(f"<font fontName='Courier' size=8>{r['expression'][:50]}...</font>", body_style), Paragraph(str(r['action']), body_style)])
+        t_cust = Table(custom_data, colWidths=[2.5*inch, 3*inch, 1.5*inch])
+        t_cust.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.lightgrey), ('GRID', (0,0), (-1,-1), 0.5, colors.grey)]))
+        story.append(t_cust)
+        story.append(Spacer(1, 10))
+
+    if ip_list_findings:
+        story.append(Paragraph("IP List Audit", h3_style))
+        for item in ip_list_findings:
+            story.append(Paragraph(f"• {item}", body_style))
+        story.append(Spacer(1, 10))
+
+    story.append(Paragraph("Zone IP Access Rules", h2_style))
+    if ip_access_rules:
+        ip_data = [["Target", "Value", "Action", "Notes"]]
+        for rule in ip_access_rules[:20]: 
+            ip_data.append([Paragraph(rule.get('configuration', {}).get('target', 'ip'), body_style), Paragraph(rule.get('configuration', {}).get('value', ''), body_style), Paragraph(rule.get('mode', ''), body_style), Paragraph(rule.get('notes', ''), body_style)])
+        t_ip = Table(ip_data, colWidths=[1*inch, 2*inch, 1*inch, 3*inch])
+        t_ip.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.lightgrey), ('GRID', (0,0), (-1,-1), 0.5, colors.grey)]))
+        story.append(t_ip)
+    else:
+        story.append(Paragraph("No IP Access Rules configured.", body_style))
+
+    story.append(Spacer(1, 15))
+    
+    story.append(Paragraph("Threat Intelligence", h2_style))
+    if 'waf' in charts:
+        img_data = base64.b64decode(charts['waf'].split(',')[1])
+        img = Image(io.BytesIO(img_data), width=7*inch, height=3.5*inch)
+        story.append(img)
+        
+    doc.build(story)
+
+def generate_portfolio_report(audit_results, output_dir):
+    logger.info("Generating Portfolio Executive Summary PDF...")
+    filename = f"{output_dir}/Portfolio_Executive_Summary.pdf"
+    
+    total_zones = len(audit_results)
+    avg_score = int(sum(r['score'] for r in audit_results) / total_zones) if total_zones > 0 else 0
+    total_critical = sum(r['counts']['Critical'] for r in audit_results)
+    total_high = sum(r['counts']['High'] for r in audit_results)
+    
+    grouped_issues = {}
+    for r in audit_results:
+        for f in r['findings']:
+            if f['severity'] in ['Critical', 'High']:
+                if f['check'] not in grouped_issues:
+                    grouped_issues[f['check']] = {"count": 0, "zones": [], "severity": f['severity']}
+                grouped_issues[f['check']]["count"] += 1
+                grouped_issues[f['check']]["zones"].append(r['zone'])
+
+    doc = SimpleDocTemplate(filename, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
+    styles = getSampleStyleSheet()
+    story = []
+
+    cf_orange = colors.Color(0.96, 0.51, 0.19)
+    dark_blue = colors.Color(0.12, 0.18, 0.25)
+    
+    title_style = ParagraphStyle('T', parent=styles['Heading1'], fontSize=28, textColor=dark_blue, alignment=TA_CENTER, spaceAfter=20)
+    h2_style = ParagraphStyle('H2', parent=styles['Heading2'], fontSize=16, textColor=cf_orange, spaceBefore=20, spaceAfter=10)
+    body_style = ParagraphStyle('B', parent=styles['BodyText'], fontSize=11, leading=14)
+    
+    story.append(Spacer(1, 0.5*inch))
+    story.append(Paragraph("Executive Security Summary", title_style))
+    story.append(Paragraph(f"Organization Portfolio Report | {datetime.now().strftime('%Y-%m-%d')}", ParagraphStyle('sub', parent=styles['Normal'], alignment=TA_CENTER, fontSize=12)))
+    story.append(Spacer(1, 0.5*inch))
+
+    dash_data = [[
+        Paragraph(f"Global Health Score<br/><font size=30>{avg_score}/100</font>", ParagraphStyle('C', alignment=TA_CENTER, textColor=colors.white, leading=36)),
+        Paragraph(f"Zones Audited: {total_zones}<br/>Critical Risks: {total_critical}<br/>High Risks: {total_high}", ParagraphStyle('stats', textColor=colors.white, leading=16))
+    ]]
+    score_color = colors.green if avg_score > 80 else colors.orange if avg_score > 50 else colors.red
+    t_dash = Table(dash_data, colWidths=[3.5*inch, 3.5*inch])
+    t_dash.setStyle(TableStyle([('BACKGROUND', (0,0), (0,0), score_color), ('BACKGROUND', (1,0), (1,0), dark_blue), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('ROUNDEDCORNERS', [8,8,8,8]), ('TOPPADDING', (0,0), (-1,-1), 25), ('BOTTOMPADDING', (0,0), (-1,-1), 25)]))
+    story.append(t_dash)
+    story.append(Spacer(1, 0.5*inch))
+    
+    story.append(Paragraph("Critical & High Risk Analysis", h2_style))
+    story.append(Paragraph("The following issues represent the most significant risks to the organization's security posture. Immediate remediation is recommended.", body_style))
+    story.append(Spacer(1, 10))
+
+    if grouped_issues:
+        for check, data in grouped_issues.items():
+            context = RISK_CATALOG.get(check, {"impact": "Security best practice violation.", "fix": "Follow standard remediation guidelines."})
+            sev_color = colors.red if data['severity'] == "Critical" else colors.orange
+            story.append(Paragraph(f"<b>{check}</b> ({data['severity']}) - Found in {data['count']} Zones", ParagraphStyle('IH', parent=styles['Heading3'], textColor=sev_color)))
+            risk_data = [
+                [Paragraph("<b>Business Impact:</b>", body_style), Paragraph(context['impact'], body_style)],
+                [Paragraph("<b>Recommendation:</b>", body_style), Paragraph(context['fix'], body_style)],
+                [Paragraph("<b>Affected Zones:</b>", body_style), Paragraph(", ".join(data['zones'][:5]) + (f" and {len(data['zones'])-5} others" if len(data['zones']) > 5 else ""), body_style)]
+            ]
+            t_risk = Table(risk_data, colWidths=[1.5*inch, 5.5*inch])
+            t_risk.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'TOP'), ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey), ('BACKGROUND', (0,0), (0,-1), colors.whitesmoke), ('PADDING', (0,0), (-1,-1), 6)]))
+            story.append(t_risk)
+            story.append(Spacer(1, 15))
+    else:
+        story.append(Paragraph("No Critical or High risks were identified across the portfolio.", body_style))
+        
+    story.append(PageBreak())
+    
+    story.append(Paragraph("Zone Performance Matrix", h2_style))
+    matrix_data = [["Zone Name", "Plan", "Score", "Critical", "High", "Status"]]
+    for r in audit_results:
+        status_text = "Pass"
+        status_color = colors.green
+        if r['counts']['Critical'] > 0: status_text = "Critical"; status_color = colors.red
+        elif r['counts']['High'] > 0: status_text = "Warning"; status_color = colors.orange
+        matrix_data.append([Paragraph(r['zone'], body_style), Paragraph(r['plan'], body_style), str(r['score']), str(r['counts']['Critical']), str(r['counts']['High']), Paragraph(f"<b>{status_text}</b>", ParagraphStyle('st', textColor=status_color))])
+        
+    t_matrix = Table(matrix_data, colWidths=[2.5*inch, 1*inch, 1*inch, 1*inch, 1*inch, 1*inch])
+    t_matrix.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), dark_blue), ('TEXTCOLOR', (0,0), (-1,0), colors.white), ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'), ('GRID', (0,0), (-1,-1), 0.5, colors.grey), ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.whitesmoke]), ('ALIGN', (2,0), (4,-1), 'CENTER')]))
+    story.append(t_matrix)
+
+    doc.build(story)
+    logger.info(f"Portfolio Summary generated: {filename}")
+
+def generate_html_dashboard(audit_results, output_dir):
+    logger.info("Generating Portfolio Executive Summary HTML...")
+    total_zones = len(audit_results)
+    avg_score = int(sum(r['score'] for r in audit_results) / total_zones) if total_zones > 0 else 0
+    total_critical = sum(r['counts']['Critical'] for r in audit_results)
+    
+    html_content = jinja2.Template(SUMMARY_HTML_TEMPLATE).render(
+        date=datetime.now().strftime('%Y-%m-%d'),
+        avg_score=avg_score,
+        total_zones=total_zones,
+        total_critical=total_critical,
+        zones=audit_results
+    )
+    with open(f"{output_dir}/Portfolio_Executive_Summary.html", "w") as f:
+        f.write(html_content)
+
+# --- MAIN ---
 
 def main():
-    # Main loop - check env, fetch zones, run checks, generate reports
-    if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_API_EMAIL:
-        logger.error("CLOUDFLARE_API_TOKEN or CLOUDFLARE_API_EMAIL not set.")
-        return
-
-    os.makedirs("cloudflare_audit_reports", exist_ok=True)
-    logger.info("Created output directory: cloudflare_audit_reports")
-
-    logger.debug("Fetching zones")
-    response = requests.get(f"{BASE_URL}/zones", headers=headers)
-    if response.status_code != 200:
-        logger.error(f"Failed to fetch zones: {response.status_code} {response.reason}, Content: {response.text}")
-        return
-
-    zones = response.json().get('result', [])
-    logger.info(f"Retrieved {len(zones)} zones: {[zone['name'] for zone in zones]}")
-    zones_data = []
-
-    for i, zone in enumerate(zones, 1):
-        zone_id = zone['id']
-        zone_name = zone['name']
-        logger.info(f"Processing zone {i} of {len(zones)}: {zone_name} ({zone_id})")
-
-        findings = []
-        findings.extend(check_min_tls_version(zone_id, zone_name))
-        findings.extend(check_true_client_ip_header(zone_id, zone_name))
-        findings.extend(check_bot_management(zone_id, zone_name))
-        findings.extend(check_security_level(zone_id, zone_name))
-        findings.extend(check_http3(zone_id, zone_name))
-        findings.extend(check_dnssec(zone_id, zone_name))
-        findings.extend(check_always_use_https(zone_id, zone_name))
-        findings.extend(check_waf(zone_id, zone_name))
-        findings.extend(check_firewall_rules(zone_id, zone_name))
-        findings.extend(check_managed_rules(zone_id, zone_name))
-        findings.extend(check_rate_limiting(zone_id, zone_name))
-        findings.extend(check_ip_access_rules(zone_id, zone_name))
-
-        dns_records = fetch_all_dns_records(zone_id, zone_name)
-
-        try:
-            html_file, pdf_file = generate_zone_pdf(zone_id, zone_name, findings, dns_records)
-            docx_file = generate_zone_docx(zone_id, zone_name, findings, dns_records)
-            if html_file and pdf_file and docx_file:
-                zones_data.append({'name': zone_name, 'findings': findings})
-            else:
-                logger.error(f"Skipping zone {zone_name} due to report generation failure")
-        except Exception as e:
-            logger.error(f"Failed to process zone {zone_name} ({zone_id}): {str(e)}")
-
     try:
-        html_file, pdf_file = generate_summary_pdf(zones_data)
-        docx_file = generate_summary_docx(zones_data)
-        if not (html_file and pdf_file and docx_file):
-            logger.error("Summary report generation failed")
+        logger.info("Fetching zones...")
+        zones_resp = requests.get(f"{BASE_URL}/zones", headers=HEADERS)
+        if zones_resp.status_code != 200:
+            logger.error("Failed to fetch zones. Check API Token permissions.")
+            return
+            
+        zones = zones_resp.json().get('result', [])
+        audit_results = []
+        output_dir = f"reports/{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Output folder: {output_dir}")
+        
+        for zone in zones:
+            zone_id = zone['id']
+            zone_name = zone['name']
+            account_id = zone['account']['id']
+            # Fetch Plan Name
+            plan_name = zone.get('plan', {}).get('name', 'Free')
+            
+            logger.info(f"Auditing {zone_name} (Plan: {plan_name})...")
+            
+            settings = get_zone_settings(zone_id)
+            rulesets = get_rulesets(zone_id)
+            ip_access_rules = get_ip_access_rules(zone_id)
+            analytics = get_graphql_analytics(zone_id)
+            dns_resp = requests.get(f"{BASE_URL}/zones/{zone_id}/dns_records", headers=HEADERS)
+            dns_records = dns_resp.json().get('result', []) if dns_resp.status_code == 200 else []
+
+            findings, managed_overrides, custom_rules, ip_list_findings = check_compliance(
+                zone_name, zone_id, account_id, settings, rulesets, analytics, ip_access_rules, dns_records, plan_name
+            )
+            
+            deductions = sum([10 for f in findings if f['severity'] in ['Critical', 'High']]) + sum([5 for f in findings if f['severity'] in ['Medium']])
+            score = max(0, 100 - deductions)
+            
+            summary_counts = {
+                "Critical": len([f for f in findings if f['severity'] == "Critical"]),
+                "High": len([f for f in findings if f['severity'] == "High"]),
+                "Pass": len([f for f in findings if f['severity'] == "Pass"])
+            }
+            
+            if analytics['total_requests'] > 0:
+                block_rate = round((analytics['total_threats'] / analytics['total_requests']) * 100, 2)
+            else:
+                block_rate = 0
+            analytics['block_rate'] = block_rate
+            
+            top_threat = "None"
+            if analytics.get('events'):
+                top_threat = analytics['events'][0]['dimensions']['source']
+            analytics['top_threat_source'] = top_threat
+
+            charts = generate_charts(analytics, zone_name)
+            
+            html_content = jinja2.Template(HTML_TEMPLATE).render(
+                title=zone_name,
+                plan=plan_name,
+                date=datetime.now().strftime('%Y-%m-%d'),
+                findings=findings,
+                analytics=analytics,
+                score=score,
+                summary_counts=summary_counts,
+                charts=charts,
+                dns_records=dns_records,
+                is_mock=analytics.get('is_mock', False),
+                managed_overrides=managed_overrides,
+                custom_rules=custom_rules,
+                ip_list_findings=ip_list_findings,
+                ip_access_rules=ip_access_rules
+            )
+            
+            with open(f"{output_dir}/{zone_name}_audit.html", "w") as f:
+                f.write(html_content)
+                
+            create_pdf_report(
+                f"{output_dir}/{zone_name}_audit.pdf", 
+                zone_name, 
+                plan_name,
+                findings, 
+                analytics, 
+                dns_records, 
+                charts,
+                score,
+                managed_overrides, 
+                custom_rules, 
+                ip_list_findings, 
+                ip_access_rules
+            )
+            
+            audit_results.append({
+                "zone": zone_name,
+                "plan": plan_name,
+                "score": score,
+                "counts": summary_counts,
+                "findings": findings 
+            })
+            
+        if audit_results:
+            csv_data = [{"zone": r['zone'], "plan": r['plan'], "score": r['score'], "critical": r['counts']['Critical'], "high": r['counts']['High']} for r in audit_results]
+            df_summary = pd.DataFrame(csv_data)
+            df_summary.to_csv(f"{output_dir}/executive_summary.csv", index=False)
+            
+            generate_portfolio_report(audit_results, output_dir)
+            generate_html_dashboard(audit_results, output_dir)
+            
+            logger.info(f"Audit Complete. Reports generated in '{output_dir}/' folder.")
+            
     except Exception as e:
-        logger.error(f"Failed to generate summary reports: {str(e)}")
+        logger.error(f"Fatal error: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
